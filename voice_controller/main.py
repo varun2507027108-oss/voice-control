@@ -670,6 +670,10 @@ class VoiceControllerPipeline:
                 self.speech_buffer = list(self.preroll_buffer)
                 self.silence_samples = 0
                 logger.debug("Speech onset detected (RMS=%.4f, floor=%.4f)", rms, vad_tracker.noise_floor)
+                self.hud.update_state(
+                    status="HEARING",
+                    live_transcription="...",
+                )
 
             self.speech_buffer.append(chunk)
             self.silence_samples = 0
@@ -759,7 +763,7 @@ class VoiceControllerPipeline:
                     if partial and partial != self._last_partial_text:
                         self._last_partial_text = partial
                         self.hud.update_state(
-                            status="LISTENING",
+                            status="HEARING",
                             live_transcription=partial,
                         )
             except Exception as err:
@@ -810,7 +814,7 @@ class VoiceControllerPipeline:
     def _process_utterance(self, audio_np: np.ndarray):
         """Execute complete pipeline pass from audio to action."""
         t_start = time.perf_counter()
-        self.hud.update_state(status="PROCESSING", live_transcription="")
+        self.hud.update_state(status="PROCESSING")
 
         # 1. STT Transcription (passing calibrated/adapted noise floor)
         stt_result, stt_latency_ms = self.stt_engine.transcribe_with_latency(

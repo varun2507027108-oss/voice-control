@@ -213,13 +213,13 @@ class SileroVAD:
 
             if is_speaking:
                 # During ongoing speech, hangover threshold prevents clipping intra-sentence pauses
-                if prob >= self.hangover_threshold or (energy_speech and prob >= 0.12):
+                if prob >= self.hangover_threshold or (energy_speech and prob >= 0.08):
                     speech_frame_detected = True
             else:
                 # Trigger onset when consecutive frames exceed onset threshold or 1 frame + energy speech
-                if prob > self.onset_threshold or (energy_speech and prob >= 0.18):
+                if prob >= self.onset_threshold or (energy_speech and prob >= 0.12):
                     self.consecutive_speech_frames += 1
-                    if self.consecutive_speech_frames >= 2 or (energy_speech and prob >= 0.25):
+                    if self.consecutive_speech_frames >= 2 or prob >= 0.40 or (energy_speech and prob >= 0.18):
                         speech_frame_detected = True
                         self.is_speaking = True
                 else:

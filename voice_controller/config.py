@@ -21,8 +21,8 @@ MAX_SPEECH_DURATION_S: float = 6.0  # Force-slice safety watchdog for continuous
 # VAD timing parameters
 SILENCE_DURATION: float = 0.8     # Seconds of continuous silence required to finalize utterance
 MIN_SPEECH_DURATION: float = 0.35  # Minimum seconds of speech needed to proceed to STT
-VAD_ONSET_THRESHOLD: float = 0.30  # Silero VAD probability threshold for speech start
-VAD_HANGOVER_THRESHOLD: float = 0.20  # Silero VAD probability threshold for speech continuation
+VAD_ONSET_THRESHOLD: float = 0.25  # Silero VAD probability threshold for speech start (responsive onset)
+VAD_HANGOVER_THRESHOLD: float = 0.15  # Silero VAD probability threshold for speech continuation
 LIVE_TRANSCRIBE_INTERVAL_S: float = 0.25  # Real-time partial transcription update cadence
 
 # Audio input device selection
@@ -62,14 +62,14 @@ class AdaptiveVAD:
     and persists calibration profiles keyed by microphone device name.
     """
 
-    def __init__(self, floor_init: float = 0.015, k: float = 2.2, alpha: float = 0.02):
+    def __init__(self, floor_init: float = 0.008, k: float = 2.0, alpha: float = 0.05):
         self.device_name: str = "default"
         self.noise_floor: float = floor_init
         self.k: float = k               # speech = k * noise_floor
         self.alpha_down: float = alpha  # Adaptation rate when environment is quieter
         self.alpha_up: float = 0.002    # Slow drift upward for gradual noise changes (HVAC/fans)
-        self.floor_min: float = 0.005   # Lower bound clamp
-        self.floor_max: float = 0.080   # Upper bound clamp
+        self.floor_min: float = 0.002   # Lower bound clamp
+        self.floor_max: float = 0.060   # Upper bound clamp
         self._load_calibrated_floor()
 
     def set_device_name(self, device_name: str):
@@ -138,11 +138,11 @@ class AdaptiveVAD:
 
         Returns (onset_threshold, hangover_threshold).
         """
-        # Dynamic margin: scales with noise floor, bounded to [0.015, 0.035]
-        margin_onset = max(0.015, min(0.035, (self.k - 1.0) * self.noise_floor))
+        # Dynamic margin: scales with noise floor, bounded to [0.006, 0.025]
+        margin_onset = max(0.006, min(0.025, (self.k - 1.0) * self.noise_floor))
         onset_threshold = self.noise_floor + margin_onset
         # Hangover threshold uses half the margin to prevent clipping during brief intra-phrase pauses
-        margin_hangover = margin_onset * 0.50
+        margin_hangover = margin_onset * 0.45
         hangover_threshold = self.noise_floor + margin_hangover
         return onset_threshold, hangover_threshold
 
@@ -188,34 +188,44 @@ DTYPE: torch.dtype = torch.float16 if torch.cuda.is_available() else torch.float
 # Intent routing confidence threshold
 CONFIDENCE_THRESHOLD: float = 0.70
 
-# HUD Overlay Aesthetics (macOS Notepad Theme)
-HUD_WIDTH: int = 380
-HUD_HEIGHT: int = 295
-HUD_ALPHA: float = 0.92
+# HUD Overlay Aesthetics (Modern Dark Obsidian Command HUD)
+HUD_WIDTH: int = 440
+HUD_HEIGHT: int = 138
+HUD_ALPHA: float = 0.95
 HUD_PADDING_X: int = 24
 HUD_PADDING_Y: int = 24
 
-# macOS Dark Palette
-COLOR_BG: str = "#1C1C1E"            # macOS Dark System Background
-COLOR_PANEL: str = "#2C2C2E"         # macOS Card / Header Toolbar
-COLOR_BORDER: str = "#38383A"        # macOS Subtle Border / Divider
-COLOR_TEXT_MAIN: str = "#FFFFFF"     # High-contrast clean white
-COLOR_TEXT_MUTED: str = "#8E8E93"    # macOS System Gray
-COLOR_TEXT_NOTE: str = "#E5E5EA"     # macOS Note Body Text
-COLOR_ACCENT: str = "#0A84FF"        # macOS System Blue
-COLOR_ACCENT_GOLD: str = "#FFD60A"   # Classic Apple Notes Accent
+# Sleek Obsidian & Titanium Palette
+COLOR_BG: str = "#0B0D11"            # Obsidian Matte Black
+COLOR_PANEL: str = "#13161D"         # Titanium Header / Bar
+COLOR_CARD: str = "#161922"          # Central Transcription Capsule
+COLOR_BORDER: str = "#222634"        # Hairline Perimeter Border
+COLOR_BORDER_SUBTLE: str = "#1A1D27" # Inner Divider / Capsule Border
+COLOR_TEXT_MAIN: str = "#F8FAFC"     # Bright High-Contrast White
+COLOR_TEXT_MUTED: str = "#64748B"    # Slate Gray
+COLOR_TEXT_SUBTLE: str = "#475569"   # Dark Slate Telemetry
+COLOR_TEXT_LIVE: str = "#38BDF8"     # Electric Sky Blue for Live Transcription
+COLOR_ACCENT: str = "#38BDF8"        # Precision Sky Blue
+COLOR_ACCENT_AMBER: str = "#F59E0B"  # Warm Amber for Hearing / Voice Onset
+COLOR_ACCENT_GOLD: str = "#F59E0B"   # Backward compatibility
 
-# Traffic Light Colors (macOS standard)
-COLOR_TL_RED: str = "#FF5F56"
-COLOR_TL_YELLOW: str = "#FFBD2E"
-COLOR_TL_GREEN: str = "#27C93F"
-COLOR_TL_BORDER_RED: str = "#E0443E"
-COLOR_TL_BORDER_YELLOW: str = "#DEA123"
-COLOR_TL_BORDER_GREEN: str = "#1AAB29"
+# Control Button Colors
+COLOR_BTN_HOVER: str = "#252A38"
+COLOR_BTN_CLOSE_HOVER: str = "#E11D48"
+
+# Traffic Light Colors (Kept for backward compatibility with tests)
+COLOR_TL_RED: str = "#EF4444"
+COLOR_TL_YELLOW: str = "#F59E0B"
+COLOR_TL_GREEN: str = "#10B981"
+COLOR_TL_BORDER_RED: str = "#DC2626"
+COLOR_TL_BORDER_YELLOW: str = "#D97706"
+COLOR_TL_BORDER_GREEN: str = "#059669"
 
 # Status Colors
-COLOR_STATUS_LISTENING: str = "#30D158"   # macOS Green
-COLOR_STATUS_PROCESSING: str = "#FF9F0A"  # macOS Orange
-COLOR_STATUS_EXECUTED: str = "#0A84FF"    # macOS Blue
-COLOR_STATUS_IGNORED: str = "#FF453A"     # macOS Red
-COLOR_STATUS_OFFLINE: str = "#636366"     # macOS Gray
+COLOR_STATUS_LISTENING: str = "#10B981"   # Emerald Green
+COLOR_STATUS_HEARING: str = "#F59E0B"     # Amber (Speech in progress)
+COLOR_STATUS_PROCESSING: str = "#38BDF8"  # Electric Blue (STT/Intent)
+COLOR_STATUS_EXECUTED: str = "#10B981"    # Emerald Green (Action Executed)
+COLOR_STATUS_IGNORED: str = "#F43F5E"     # Rose Red (Unrecognized)
+COLOR_STATUS_OFFLINE: str = "#64748B"     # Slate Gray
+

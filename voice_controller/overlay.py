@@ -1,4 +1,9 @@
-"""macOS-styled Desktop Notepad overlay for Voice Control with High-DPI, Traffic Lights, and Tray restore."""
+"""Modern Non-AI Generic Floating Voice HUD Overlay.
+
+Sleek, dark obsidian command bar inspired by Raycast, Linear, and precision audio
+tooling. Features real-time live transcription streaming, multi-bar audio VU
+visualizer, discrete execution badges, system tray integration, and High-DPI support.
+"""
 
 import ctypes
 import datetime
@@ -14,23 +19,29 @@ import pystray
 from voice_controller.config import (
     COLOR_BG,
     COLOR_PANEL,
+    COLOR_CARD,
     COLOR_BORDER,
+    COLOR_BORDER_SUBTLE,
     COLOR_TEXT_MAIN,
     COLOR_TEXT_MUTED,
-    COLOR_TEXT_NOTE,
+    COLOR_TEXT_SUBTLE,
+    COLOR_TEXT_LIVE,
     COLOR_ACCENT,
-    COLOR_ACCENT_GOLD,
+    COLOR_ACCENT_AMBER,
+    COLOR_STATUS_LISTENING,
+    COLOR_STATUS_HEARING,
+    COLOR_STATUS_PROCESSING,
+    COLOR_STATUS_EXECUTED,
+    COLOR_STATUS_IGNORED,
+    COLOR_STATUS_OFFLINE,
+    COLOR_BTN_HOVER,
+    COLOR_BTN_CLOSE_HOVER,
     COLOR_TL_RED,
     COLOR_TL_YELLOW,
     COLOR_TL_GREEN,
     COLOR_TL_BORDER_RED,
     COLOR_TL_BORDER_YELLOW,
     COLOR_TL_BORDER_GREEN,
-    COLOR_STATUS_LISTENING,
-    COLOR_STATUS_PROCESSING,
-    COLOR_STATUS_EXECUTED,
-    COLOR_STATUS_IGNORED,
-    COLOR_STATUS_OFFLINE,
     HUD_WIDTH,
     HUD_HEIGHT,
     HUD_ALPHA,
@@ -38,16 +49,16 @@ from voice_controller.config import (
     HUD_PADDING_Y,
 )
 
-logger = logging.getLogger("MacOSNotepadOverlay")
+logger = logging.getLogger("VoiceOverlayHUD")
 
-# macOS Typography stack
-FONT_TITLE = ("Segoe UI", 10, "bold")
-FONT_SUBTITLE = ("Segoe UI", 8)
-FONT_NOTE_DATE = ("Segoe UI", 8)
-FONT_NOTE_TITLE = ("Segoe UI", 11, "bold")
-FONT_NOTE_BODY = ("Segoe UI", 9)
-FONT_NOTE_FEEDBACK = ("Segoe UI", 8, "italic")
-FONT_STATUS_PILL = ("Segoe UI", 8, "bold")
+# Precision Modern Typography stack
+FONT_BRAND = ("Segoe UI", 8, "bold")
+FONT_STATUS = ("Segoe UI", 7, "bold")
+FONT_TRANSCRIPTION = ("Segoe UI", 12, "bold")
+FONT_FEEDBACK = ("Segoe UI", 8, "bold")
+FONT_TELEMETRY = ("Segoe UI", 7, "bold")
+FONT_LOAD_TITLE = ("Segoe UI", 11, "bold")
+FONT_LOAD_SUB = ("Segoe UI", 8)
 
 
 def _enable_high_dpi():
@@ -62,20 +73,21 @@ def _enable_high_dpi():
 
 
 def _generate_tray_icon() -> Image.Image:
-    """Generate crisp 64x64 RGBA system tray icon."""
+    """Generate crisp 64x64 RGBA system tray icon for dark / light taskbars."""
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    # Dark rounded background
-    draw.rounded_rectangle((4, 4, 60, 60), radius=14, fill="#1C1C1E", outline="#FFD60A", width=3)
-    # macOS note lines
-    draw.line((18, 22, 46, 22), fill="#FFFFFF", width=4)
-    draw.line((18, 32, 46, 32), fill="#FFFFFF", width=4)
-    draw.line((18, 42, 34, 42), fill="#FFD60A", width=4)
+    # Dark obsidian capsule background
+    draw.rounded_rectangle((4, 4, 60, 60), radius=16, fill="#0B0D11", outline="#38BDF8", width=3)
+    # Microphone glyph
+    draw.rounded_rectangle((26, 16, 38, 36), radius=6, fill="#38BDF8")
+    draw.arc((20, 24, 44, 44), start=0, end=180, fill="#F8FAFC", width=3)
+    draw.line((32, 44, 32, 50), fill="#F8FAFC", width=3)
+    draw.line((24, 50, 40, 50), fill="#F8FAFC", width=3)
     return img
 
 
 class HUDOverlay:
-    """macOS-styled minimal Notepad overlay pinned to the desktop with Traffic Lights and System Tray."""
+    """Precision floating voice command HUD with live transcription and audio level VU meter."""
 
     def __init__(self, on_close_callback=None):
         self.on_close_callback = on_close_callback
@@ -89,19 +101,23 @@ class HUDOverlay:
         self.is_loading_mode = True
         self._drag_start_x = 0
         self._drag_start_y = 0
+        self._last_committed_text = ""
+        self._reset_timer = None
 
-        # Throttling trackers
-        self._last_pulse_draw_time = 0.0
-        self._last_pulse_level = 0.0
+        # Audio VU Visualizer smoothing state
+        self._vu_bars = [2.0] * 7
+        self._vu_multipliers = [0.45, 0.70, 1.00, 0.95, 0.75, 0.55, 0.35]
+        self._last_vu_time = 0.0
+        self._current_audio_level = 0.0
 
     def start(self):
         """Initialize Tkinter root with High-DPI awareness and enter event loop."""
         _enable_high_dpi()
 
         self.root = tk.Tk()
-        self.root.title("Notes")
+        self.root.title("Voice Control")
 
-        # Window styling: frameless, transparent, always-on-top
+        # Window styling: frameless, acrylic alpha, always-on-top
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         try:
@@ -128,157 +144,177 @@ class HUDOverlay:
         self.root.mainloop()
 
     def _build_ui(self):
-        """Construct macOS dark notepad interface with traffic lights."""
-        self.container = tk.Frame(self.root, bg=COLOR_BG, bd=0)
+        """Construct precision obsidian voice command HUD."""
+        # 1. Outer 1px precision hairline border
+        self.outer_frame = tk.Frame(self.root, bg=COLOR_BORDER, bd=0)
+        self.outer_frame.pack(fill="both", expand=True)
+
+        # 2. Main obsidian container
+        self.container = tk.Frame(self.outer_frame, bg=COLOR_BG, bd=0)
         self.container.pack(fill="both", expand=True, padx=1, pady=1)
 
-        # 1. macOS Window Header (Only draggable surface)
-        self.header = tk.Frame(self.container, bg=COLOR_PANEL, height=36)
+        # Make entire HUD surface draggable (convenience for floating bar)
+        self.container.bind("<ButtonPress-1>", self._on_drag_start)
+        self.container.bind("<B1-Motion>", self._on_drag_motion)
+
+        # =========================================================================
+        # SECTION 1: HEADER STRIP (Height: 32px)
+        # =========================================================================
+        self.header = tk.Frame(self.container, bg=COLOR_PANEL, height=32)
         self.header.pack(fill="x", side="top")
         self.header.pack_propagate(False)
-
-        # Drag bindings restricted strictly to header
         self.header.bind("<ButtonPress-1>", self._on_drag_start)
         self.header.bind("<B1-Motion>", self._on_drag_motion)
 
-        # --- macOS Traffic Lights (🔴 🟡 🟢) on far left ---
-        tl_frame = tk.Frame(self.header, bg=COLOR_PANEL)
-        tl_frame.pack(side="left", padx=(10, 4), pady=6)
-        tl_frame.bind("<ButtonPress-1>", self._on_drag_start)
-        tl_frame.bind("<B1-Motion>", self._on_drag_motion)
+        # Left: Drag grip & Brand title
+        brand_frame = tk.Frame(self.header, bg=COLOR_PANEL)
+        brand_frame.pack(side="left", padx=(10, 6), pady=4)
+        brand_frame.bind("<ButtonPress-1>", self._on_drag_start)
+        brand_frame.bind("<B1-Motion>", self._on_drag_motion)
 
-        # 🔴 Red button: Quit
-        self.btn_close = tk.Canvas(tl_frame, width=12, height=12, bg=COLOR_PANEL, bd=0, highlightthickness=0, cursor="hand2")
-        self.btn_close.pack(side="left", padx=3)
-        self.btn_close_circle = self.btn_close.create_oval(1, 1, 11, 11, fill=COLOR_TL_RED, outline=COLOR_TL_BORDER_RED, width=1)
-        self.btn_close.bind("<Button-1>", lambda e: self.close())
-        self.btn_close.bind("<Enter>", lambda e: self.btn_close.itemconfig(self.btn_close_circle, fill="#FF7B73"))
-        self.btn_close.bind("<Leave>", lambda e: self.btn_close.itemconfig(self.btn_close_circle, fill=COLOR_TL_RED))
-
-        # 🟡 Yellow button: Minimize to System Tray (with pystray restore)
-        self.btn_min = tk.Canvas(tl_frame, width=12, height=12, bg=COLOR_PANEL, bd=0, highlightthickness=0, cursor="hand2")
-        self.btn_min.pack(side="left", padx=3)
-        self.btn_min_circle = self.btn_min.create_oval(1, 1, 11, 11, fill=COLOR_TL_YELLOW, outline=COLOR_TL_BORDER_YELLOW, width=1)
-        self.btn_min.bind("<Button-1>", lambda e: self.minimize_to_tray())
-        self.btn_min.bind("<Enter>", lambda e: self.btn_min.itemconfig(self.btn_min_circle, fill="#FFCE52"))
-        self.btn_min.bind("<Leave>", lambda e: self.btn_min.itemconfig(self.btn_min_circle, fill=COLOR_TL_YELLOW))
-
-        # 🟢 Green button: Reset size & position to default top-right
-        self.btn_reset = tk.Canvas(tl_frame, width=12, height=12, bg=COLOR_PANEL, bd=0, highlightthickness=0, cursor="hand2")
-        self.btn_reset.pack(side="left", padx=3)
-        self.btn_reset_circle = self.btn_reset.create_oval(1, 1, 11, 11, fill=COLOR_TL_GREEN, outline=COLOR_TL_BORDER_GREEN, width=1)
-        self.btn_reset.bind("<Button-1>", lambda e: self.reset_window())
-        self.btn_reset.bind("<Enter>", lambda e: self.btn_reset.itemconfig(self.btn_reset_circle, fill="#4CD964"))
-        self.btn_reset.bind("<Leave>", lambda e: self.btn_reset.itemconfig(self.btn_reset_circle, fill=COLOR_TL_GREEN))
-
-        # App Icon & Title (Left aligned)
-        title_frame = tk.Frame(self.header, bg=COLOR_PANEL)
-        title_frame.pack(side="left", padx=(6, 8), pady=6)
-        title_frame.bind("<ButtonPress-1>", self._on_drag_start)
-        title_frame.bind("<B1-Motion>", self._on_drag_motion)
-
-        icon_lbl = tk.Label(
-            title_frame,
-            text="📝",
-            font=("Segoe UI Emoji", 10),
-            bg=COLOR_PANEL,
-            fg=COLOR_ACCENT_GOLD,
-        )
-        icon_lbl.pack(side="left", padx=(0, 6))
-        icon_lbl.bind("<ButtonPress-1>", self._on_drag_start)
-        icon_lbl.bind("<B1-Motion>", self._on_drag_motion)
-
-        title_lbl = tk.Label(
-            title_frame,
-            text="Notes",
-            font=FONT_TITLE,
-            fg=COLOR_TEXT_MAIN,
+        lbl_grip = tk.Label(
+            brand_frame,
+            text="⠿",
+            font=("Segoe UI", 9),
+            fg=COLOR_TEXT_SUBTLE,
             bg=COLOR_PANEL,
         )
-        title_lbl.pack(side="left")
-        title_lbl.bind("<ButtonPress-1>", self._on_drag_start)
-        title_lbl.bind("<B1-Motion>", self._on_drag_motion)
+        lbl_grip.pack(side="left", padx=(0, 6))
+        lbl_grip.bind("<ButtonPress-1>", self._on_drag_start)
+        lbl_grip.bind("<B1-Motion>", self._on_drag_motion)
 
-        # Discreet macOS Status Pill (Right aligned)
-        self.status_pill = tk.Frame(self.header, bg="#202023", padx=8, pady=3)
-        self.status_pill.pack(side="right", padx=12, pady=6)
+        lbl_brand = tk.Label(
+            brand_frame,
+            text="VOICE CONTROL",
+            font=FONT_BRAND,
+            fg=COLOR_TEXT_MUTED,
+            bg=COLOR_PANEL,
+        )
+        lbl_brand.pack(side="left")
+        lbl_brand.bind("<ButtonPress-1>", self._on_drag_start)
+        lbl_brand.bind("<B1-Motion>", self._on_drag_motion)
+
+        # Tactile Status Pill Badge
+        self.status_pill = tk.Frame(self.header, bg="#181B24", padx=7, pady=2)
+        self.status_pill.pack(side="left", padx=8, pady=4)
         self.status_pill.bind("<ButtonPress-1>", self._on_drag_start)
         self.status_pill.bind("<B1-Motion>", self._on_drag_motion)
 
         self.status_dot = tk.Label(
             self.status_pill,
             text="●",
-            font=FONT_STATUS_PILL,
+            font=("Segoe UI", 7, "bold"),
             fg=COLOR_STATUS_LISTENING,
-            bg="#202023",
+            bg="#181B24",
         )
         self.status_dot.pack(side="left", padx=(0, 4))
 
         self.status_text = tk.Label(
             self.status_pill,
-            text="Starting...",
-            font=FONT_STATUS_PILL,
+            text="STARTING",
+            font=FONT_STATUS,
             fg=COLOR_STATUS_LISTENING,
-            bg="#202023",
+            bg="#181B24",
         )
         self.status_text.pack(side="left")
 
-        # Subtle thin audio meter / accent bar below header
-        self.canvas_pulse = tk.Canvas(
-            self.container,
-            bg=COLOR_BORDER,
-            height=2,
+        # Center / Right: Live Multi-Bar Audio VU Visualizer
+        vu_frame = tk.Frame(self.header, bg=COLOR_PANEL)
+        vu_frame.pack(side="left", padx=(10, 4), pady=4)
+        vu_frame.bind("<ButtonPress-1>", self._on_drag_start)
+        vu_frame.bind("<B1-Motion>", self._on_drag_motion)
+
+        self.canvas_vu = tk.Canvas(
+            vu_frame,
+            width=50,
+            height=14,
+            bg=COLOR_PANEL,
             bd=0,
             highlightthickness=0,
         )
-        self.canvas_pulse.pack(fill="x", side="top")
-        self.pulse_bar = self.canvas_pulse.create_rectangle(
-            0, 0, 0, 2, fill=COLOR_ACCENT, width=0
-        )
+        self.canvas_vu.pack(side="left")
+        self.canvas_vu.bind("<ButtonPress-1>", self._on_drag_start)
+        self.canvas_vu.bind("<B1-Motion>", self._on_drag_motion)
 
-        # 2. Body Views Container
+        # Pre-create 7 equalizer bars
+        self.vu_bar_ids = []
+        bar_w = 4
+        bar_gap = 3
+        for i in range(7):
+            bx1 = i * (bar_w + bar_gap) + 2
+            bx2 = bx1 + bar_w
+            bid = self.canvas_vu.create_rectangle(
+                bx1, 12, bx2, 14, fill="#1E2330", width=0
+            )
+            self.vu_bar_ids.append(bid)
+
+        # Far Right: Precision Window Controls (Minimize, Reset, Close)
+        ctrl_frame = tk.Frame(self.header, bg=COLOR_PANEL)
+        ctrl_frame.pack(side="right", padx=(4, 8), pady=4)
+
+        # Reset button (Green circle compatibility / Reset geometry)
+        self.btn_reset = tk.Canvas(ctrl_frame, width=12, height=12, bg=COLOR_PANEL, bd=0, highlightthickness=0, cursor="hand2")
+        self.btn_reset.pack(side="left", padx=3)
+        self.btn_reset_circle = self.btn_reset.create_oval(1, 1, 11, 11, fill="#10B981", outline=COLOR_TL_BORDER_GREEN, width=1)
+        self.btn_reset.bind("<Button-1>", lambda e: self.reset_window())
+        self.btn_reset.bind("<Enter>", lambda e: self.btn_reset.itemconfig(self.btn_reset_circle, fill="#34D399"))
+        self.btn_reset.bind("<Leave>", lambda e: self.btn_reset.itemconfig(self.btn_reset_circle, fill="#10B981"))
+
+        # Minimize to Tray button (Yellow circle compatibility / Minimize)
+        self.btn_min = tk.Canvas(ctrl_frame, width=12, height=12, bg=COLOR_PANEL, bd=0, highlightthickness=0, cursor="hand2")
+        self.btn_min.pack(side="left", padx=3)
+        self.btn_min_circle = self.btn_min.create_oval(1, 1, 11, 11, fill="#F59E0B", outline=COLOR_TL_BORDER_YELLOW, width=1)
+        self.btn_min.bind("<Button-1>", lambda e: self.minimize_to_tray())
+        self.btn_min.bind("<Enter>", lambda e: self.btn_min.itemconfig(self.btn_min_circle, fill="#FBBF24"))
+        self.btn_min.bind("<Leave>", lambda e: self.btn_min.itemconfig(self.btn_min_circle, fill="#F59E0B"))
+
+        # Close / Quit button (Red circle compatibility / Close)
+        self.btn_close = tk.Canvas(ctrl_frame, width=12, height=12, bg=COLOR_PANEL, bd=0, highlightthickness=0, cursor="hand2")
+        self.btn_close.pack(side="left", padx=3)
+        self.btn_close_circle = self.btn_close.create_oval(1, 1, 11, 11, fill="#EF4444", outline=COLOR_TL_BORDER_RED, width=1)
+        self.btn_close.bind("<Button-1>", lambda e: self.close())
+        self.btn_close.bind("<Enter>", lambda e: self.btn_close.itemconfig(self.btn_close_circle, fill="#F87171"))
+        self.btn_close.bind("<Leave>", lambda e: self.btn_close.itemconfig(self.btn_close_circle, fill="#EF4444"))
+
+        # =========================================================================
+        # SECTION 2: BODY AREA (Swappable Loading vs Live Command View)
+        # =========================================================================
         self.body_area = tk.Frame(self.container, bg=COLOR_BG)
         self.body_area.pack(fill="both", expand=True)
+        self.body_area.bind("<ButtonPress-1>", self._on_drag_start)
+        self.body_area.bind("<B1-Motion>", self._on_drag_motion)
 
-        # --- VIEW A: macOS Loading Screen ---
+        # --- VIEW A: Sleek Obsidian Loader ---
         self.loading_view = tk.Frame(self.body_area, bg=COLOR_BG)
         self.loading_view.pack(fill="both", expand=True)
 
-        loader_inner = tk.Frame(self.loading_view, bg=COLOR_BG)
-        loader_inner.place(relx=0.5, rely=0.5, anchor="center")
-
-        lbl_load_icon = tk.Label(
-            loader_inner,
-            text="🎙️",
-            font=("Segoe UI Emoji", 26),
-            bg=COLOR_BG,
-        )
-        lbl_load_icon.pack(pady=(0, 6))
+        load_inner = tk.Frame(self.loading_view, bg=COLOR_BG)
+        load_inner.place(relx=0.5, rely=0.5, anchor="center")
 
         self.lbl_load_title = tk.Label(
-            loader_inner,
-            text="Starting Voice Assistant...",
-            font=FONT_NOTE_TITLE,
+            load_inner,
+            text="Initializing Voice Control...",
+            font=FONT_LOAD_TITLE,
             fg=COLOR_TEXT_MAIN,
             bg=COLOR_BG,
         )
-        self.lbl_load_title.pack()
+        self.lbl_load_title.pack(pady=(0, 3))
 
         self.lbl_load_sub = tk.Label(
-            loader_inner,
-            text="Preparing speech recognition...",
-            font=FONT_SUBTITLE,
+            load_inner,
+            text="Warming up local STT & Intent models...",
+            font=FONT_LOAD_SUB,
             fg=COLOR_TEXT_MUTED,
             bg=COLOR_BG,
         )
-        self.lbl_load_sub.pack(pady=(2, 8))
+        self.lbl_load_sub.pack(pady=(0, 8))
 
-        # Minimalist progress track
+        # Precision Progress Track
         self.canvas_load_prog = tk.Canvas(
-            loader_inner,
-            bg="#2A2A2E",
+            load_inner,
+            bg="#1A1D27",
             height=3,
-            width=180,
+            width=220,
             bd=0,
             highlightthickness=0,
         )
@@ -289,94 +325,97 @@ class HUDOverlay:
         self._animate_loading_step = 0
         self._animate_loader()
 
-        # --- VIEW B: macOS Notepad Interface ---
-        self.notepad_view = tk.Frame(self.body_area, bg=COLOR_BG)
+        # --- VIEW B: Live Voice Command Bar ---
+        self.hud_view = tk.Frame(self.body_area, bg=COLOR_BG)
 
-        # Notepad header (Date / Subtitle)
-        now_str = datetime.datetime.now().strftime("%B %d at %I:%M %p")
-        self.lbl_note_date = tk.Label(
-            self.notepad_view,
-            text=now_str,
-            font=FONT_NOTE_DATE,
-            fg=COLOR_TEXT_MUTED,
-            bg=COLOR_BG,
+        # 1. Main Live Transcription Capsule (The Centerpiece of the HUD)
+        self.card_transcription = tk.Frame(
+            self.hud_view,
+            bg=COLOR_CARD,
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_SUBTLE,
         )
-        self.lbl_note_date.pack(anchor="w", padx=14, pady=(8, 2))
+        self.card_transcription.pack(fill="x", padx=10, pady=(6, 4))
+        self.card_transcription.bind("<ButtonPress-1>", self._on_drag_start)
+        self.card_transcription.bind("<B1-Motion>", self._on_drag_motion)
 
-        # Live Speech Feedback Bar (Continuous real-time speech transcription display)
-        self.live_bar = tk.Frame(self.notepad_view, bg="#252528", padx=8, pady=4)
-        self.live_bar.pack(fill="x", padx=14, pady=(2, 4))
+        inner_card = tk.Frame(self.card_transcription, bg=COLOR_CARD, padx=10, pady=7)
+        inner_card.pack(fill="both", expand=True)
+        inner_card.bind("<ButtonPress-1>", self._on_drag_start)
+        inner_card.bind("<B1-Motion>", self._on_drag_motion)
 
-        self.lbl_live_mic = tk.Label(
-            self.live_bar,
-            text="🎙️",
-            font=("Segoe UI Emoji", 9),
-            fg=COLOR_ACCENT_GOLD,
-            bg="#252528",
+        # Left mic glyph inside capsule
+        self.lbl_mic_glyph = tk.Label(
+            inner_card,
+            text="🎙",
+            font=("Segoe UI Emoji", 11),
+            fg=COLOR_ACCENT,
+            bg=COLOR_CARD,
         )
-        self.lbl_live_mic.pack(side="left", padx=(0, 6))
+        self.lbl_mic_glyph.pack(side="left", padx=(0, 8))
+        self.lbl_mic_glyph.bind("<ButtonPress-1>", self._on_drag_start)
+        self.lbl_mic_glyph.bind("<B1-Motion>", self._on_drag_motion)
 
-        self.lbl_live_transcription = tk.Label(
-            self.live_bar,
-            text="Listening for speech...",
-            font=("Segoe UI", 9, "italic"),
+        # High-visibility Live Transcription Text Label
+        self.lbl_transcription = tk.Label(
+            inner_card,
+            text="Listening for voice commands...",
+            font=FONT_TRANSCRIPTION,
             fg=COLOR_TEXT_MUTED,
-            bg="#252528",
+            bg=COLOR_CARD,
             anchor="w",
             justify="left",
+            wraplength=360,
         )
-        self.lbl_live_transcription.pack(side="left", fill="x", expand=True)
+        self.lbl_transcription.pack(side="left", fill="both", expand=True)
+        self.lbl_transcription.bind("<ButtonPress-1>", self._on_drag_start)
+        self.lbl_transcription.bind("<B1-Motion>", self._on_drag_motion)
 
-        # Scrolled text area styled like macOS Notes (Read-only, allows text selection)
-        self.note_text = tk.Text(
-            self.notepad_view,
-            bg=COLOR_BG,
-            fg=COLOR_TEXT_NOTE,
-            insertbackground=COLOR_ACCENT,
-            selectbackground="#3A3A3C",
-            selectforeground=COLOR_TEXT_MAIN,
-            font=FONT_NOTE_BODY,
-            wrap="word",
-            bd=0,
-            padx=14,
-            pady=4,
-            highlightthickness=0,
-            height=6,
+        # 2. Bottom Action Feedback & Telemetry Strip (Height ~26px)
+        self.footer = tk.Frame(self.hud_view, bg=COLOR_BG)
+        self.footer.pack(fill="x", side="bottom", padx=10, pady=(2, 6))
+        self.footer.bind("<ButtonPress-1>", self._on_drag_start)
+        self.footer.bind("<B1-Motion>", self._on_drag_motion)
+
+        # Left: Sleek Action Feedback Badge Pill
+        self.action_pill = tk.Frame(self.footer, bg="#161922", padx=8, pady=3)
+        self.action_pill.pack(side="left")
+        self.action_pill.bind("<ButtonPress-1>", self._on_drag_start)
+        self.action_pill.bind("<B1-Motion>", self._on_drag_motion)
+
+        self.lbl_action_badge = tk.Label(
+            self.action_pill,
+            text='e.g. "volume up", "open chrome", "dim screen"',
+            font=FONT_FEEDBACK,
+            fg=COLOR_TEXT_SUBTLE,
+            bg="#161922",
+            anchor="w",
         )
-        self.note_text.pack(fill="both", expand=True)
+        self.lbl_action_badge.pack(side="left")
+        self.lbl_action_badge.bind("<ButtonPress-1>", self._on_drag_start)
+        self.lbl_action_badge.bind("<B1-Motion>", self._on_drag_motion)
 
-        # Rich text tags
-        self.note_text.tag_configure("timestamp", foreground=COLOR_TEXT_MUTED, font=FONT_NOTE_DATE)
-        self.note_text.tag_configure("user_speech", foreground=COLOR_TEXT_MAIN, font=FONT_NOTE_BODY)
-        self.note_text.tag_configure("action_ok", foreground=COLOR_STATUS_LISTENING, font=FONT_NOTE_FEEDBACK)
-        self.note_text.tag_configure("action_warn", foreground=COLOR_STATUS_PROCESSING, font=FONT_NOTE_FEEDBACK)
-        self.note_text.tag_configure("live_draft", foreground=COLOR_ACCENT, font=FONT_NOTE_FEEDBACK)
-
-        # Initial placeholder note
-        self.note_text.insert("end", "Speak a command (e.g. \"Turn up volume\", \"Open Chrome\", \"Dim screen\")...\n\n", "timestamp")
-        self.note_text.config(state="disabled")
-
-        # Bottom footer note
-        self.footer = tk.Frame(self.notepad_view, bg=COLOR_BG, height=22)
-        self.footer.pack(fill="x", side="bottom", padx=14, pady=(0, 6))
-
-        self.lbl_footer = tk.Label(
+        # Right: Local Model Telemetry Badge
+        self.lbl_telemetry = tk.Label(
             self.footer,
-            text="🔴 Quit  🟡 Minimize to Tray  🟢 Reset",
-            font=FONT_SUBTITLE,
-            fg=COLOR_TEXT_MUTED,
+            text="100% LOCAL",
+            font=FONT_TELEMETRY,
+            fg=COLOR_TEXT_SUBTLE,
             bg=COLOR_BG,
         )
-        self.lbl_footer.pack(side="left")
+        self.lbl_telemetry.pack(side="right", padx=(4, 0))
+        self.lbl_telemetry.bind("<ButtonPress-1>", self._on_drag_start)
+        self.lbl_telemetry.bind("<B1-Motion>", self._on_drag_motion)
 
     def _animate_loader(self):
         """Smooth progress pulse for the loading bar."""
         if not self._is_running or not self.is_loading_mode:
             return
 
-        w = 180
+        w = 220
         bar_len = 50
-        x1 = (self._animate_loading_step * 4) % (w + bar_len) - bar_len
+        x1 = (self._animate_loading_step * 5) % (w + bar_len) - bar_len
         x2 = x1 + bar_len
         if hasattr(self, "canvas_load_prog") and hasattr(self, "load_bar"):
             self.canvas_load_prog.coords(self.load_bar, max(0, x1), 0, min(w, x2), 3)
@@ -386,19 +425,17 @@ class HUDOverlay:
             self.root.after(30, self._animate_loader)
 
     def _on_drag_start(self, event):
-        self._drag_start_x = event.x
-        self._drag_start_y = event.y
+        self._drag_start_x = event.x_root - self.root.winfo_x()
+        self._drag_start_y = event.y_root - self.root.winfo_y()
 
     def _on_drag_motion(self, event):
         if self.root:
-            deltax = event.x - self._drag_start_x
-            deltay = event.y - self._drag_start_y
-            new_x = self.root.winfo_x() + deltax
-            new_y = self.root.winfo_y() + deltay
+            new_x = event.x_root - self._drag_start_x
+            new_y = event.y_root - self._drag_start_y
             self.root.geometry(f"+{new_x}+{new_y}")
 
     def minimize_to_tray(self):
-        """Minimize overlay to system tray via pystray (Yellow traffic light)."""
+        """Minimize overlay to system tray via pystray."""
         logger.info("Minimizing HUD overlay to system tray...")
         if self.root:
             self.root.withdraw()
@@ -412,9 +449,8 @@ class HUDOverlay:
         try:
             icon_img = _generate_tray_icon()
             menu = pystray.Menu(
-                pystray.MenuItem("Open Voice Notes", self.restore_from_tray, default=True),
+                pystray.MenuItem("Open Voice Control", self.restore_from_tray, default=True),
                 pystray.MenuItem("Reset Size & Position", lambda icon, item: self.root.after(0, self.reset_window)),
-                pystray.MenuItem("Clear Notes", lambda icon, item: self.root.after(0, self._clear_notes)),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Quit", lambda icon, item: self.root.after(0, self.close)),
             )
@@ -445,7 +481,7 @@ class HUDOverlay:
         logger.info("HUD overlay restored from system tray.")
 
     def reset_window(self):
-        """Reset window geometry to default top-right position and size (Green traffic light)."""
+        """Reset window geometry to default top-right position and size."""
         if self.root:
             screen_w = self.root.winfo_screenwidth()
             pos_x = screen_w - HUD_WIDTH - HUD_PADDING_X
@@ -455,14 +491,6 @@ class HUDOverlay:
             self.root.lift()
             self.root.attributes("-topmost", True)
             logger.info("HUD overlay geometry reset to %dx%d at (+%d,+%d).", HUD_WIDTH, HUD_HEIGHT, pos_x, pos_y)
-
-    def _clear_notes(self):
-        """Clear user notes in notepad."""
-        if hasattr(self, "note_text"):
-            self.note_text.config(state="normal")
-            self.note_text.delete("1.0", "end")
-            self.note_text.insert("end", "Notes reset.\n\n", "timestamp")
-            self.note_text.config(state="disabled")
 
     def update_state(
         self,
@@ -502,16 +530,16 @@ class HUDOverlay:
                 self.root.after(33, self._process_queue)
 
     def _apply_update(self, msg: Dict[str, Any]):
-        # Switch between Loading View and Notepad View
+        # Switch between Loading View and HUD View
         if msg.get("is_loading") is not None:
             self.is_loading_mode = bool(msg["is_loading"])
             if self.is_loading_mode:
-                self.notepad_view.pack_forget()
+                self.hud_view.pack_forget()
                 self.loading_view.pack(fill="both", expand=True)
                 self._animate_loader()
             else:
                 self.loading_view.pack_forget()
-                self.notepad_view.pack(fill="both", expand=True)
+                self.hud_view.pack(fill="both", expand=True)
 
         if msg.get("loading_message") and hasattr(self, "lbl_load_sub"):
             self.lbl_load_sub.config(text=msg["loading_message"])
@@ -520,133 +548,175 @@ class HUDOverlay:
         status = msg.get("status")
         if status:
             self.current_status = status.upper()
-
             if self.current_status == "LISTENING":
-                self.status_dot.config(fg=COLOR_STATUS_LISTENING)
-                self.status_text.config(text="Listening", fg=COLOR_STATUS_LISTENING)
+                self._set_status_pill("LISTENING", COLOR_STATUS_LISTENING)
+            elif self.current_status == "HEARING":
+                self._set_status_pill("HEARING", COLOR_STATUS_HEARING)
             elif self.current_status == "PROCESSING":
-                self.status_dot.config(fg=COLOR_STATUS_PROCESSING)
-                self.status_text.config(text="Thinking...", fg=COLOR_STATUS_PROCESSING)
+                self._set_status_pill("THINKING", COLOR_STATUS_PROCESSING)
             elif self.current_status == "EXECUTED":
-                self.status_dot.config(fg=COLOR_STATUS_EXECUTED)
-                self.status_text.config(text="Done", fg=COLOR_STATUS_EXECUTED)
+                self._set_status_pill("DONE", COLOR_STATUS_EXECUTED)
             elif self.current_status == "IGNORED":
-                self.status_dot.config(fg=COLOR_STATUS_IGNORED)
-                self.status_text.config(text="Unrecognized", fg=COLOR_STATUS_IGNORED)
+                self._set_status_pill("UNRECOGNIZED", COLOR_STATUS_IGNORED)
             else:
-                self.status_dot.config(fg=COLOR_STATUS_OFFLINE)
-                self.status_text.config(text="Ready", fg=COLOR_STATUS_OFFLINE)
+                self._set_status_pill(self.current_status[:10], COLOR_STATUS_OFFLINE)
 
-        # Continuous Live Transcription Update
+        # Continuous Live Streaming Transcription Update
         if "live_transcription" in msg and msg["live_transcription"] is not None:
             self._update_live_transcription(msg["live_transcription"])
 
-        # Notepad Note Commit
+        # Committed Action Feedback
         feedback = msg.get("feedback")
         transcription = msg.get("transcription")
-
         if feedback and not self.is_loading_mode:
-            self._append_notepad_entry(transcription, feedback, status=self.current_status)
+            self._commit_command_result(transcription, feedback, status=self.current_status)
 
-        # Throttled Audio Level Pulse (only redraw if delta > 0.02 or >=100ms elapsed)
+        # Real-time Multi-bar Audio VU Visualizer Update
         audio_level = msg.get("audio_level")
-        if audio_level is not None and hasattr(self, "canvas_pulse"):
-            now = time.perf_counter()
-            if abs(audio_level - self._last_pulse_level) > 0.02 or (now - self._last_pulse_draw_time) >= 0.08:
-                self._last_pulse_level = audio_level
-                self._last_pulse_draw_time = now
+        if audio_level is not None:
+            self._current_audio_level = max(0.0, min(1.0, float(audio_level)))
+            self._update_vu_meter(self._current_audio_level)
 
-                w = HUD_WIDTH
-                bar_w = int(max(0.0, min(1.0, audio_level)) * w)
-                bar_color = COLOR_STATUS_LISTENING
-                if self.current_status == "PROCESSING":
-                    bar_color = COLOR_STATUS_PROCESSING
-                elif self.current_status == "EXECUTED":
-                    bar_color = COLOR_STATUS_EXECUTED
+    def _set_status_pill(self, label: str, color: str):
+        """Update top status pill text and glowing dot."""
+        if hasattr(self, "status_dot") and hasattr(self, "status_text"):
+            self.status_dot.config(fg=color)
+            self.status_text.config(text=label, fg=color)
 
-                self.canvas_pulse.coords(self.pulse_bar, 0, 0, bar_w, 2)
-                self.canvas_pulse.itemconfig(self.pulse_bar, fill=bar_color)
+    def _update_vu_meter(self, level: float):
+        """Animate 7-bar audio equalizer based on live mic input level with smooth falloff."""
+        if not hasattr(self, "canvas_vu") or not hasattr(self, "vu_bar_ids"):
+            return
+
+        bar_h_max = 12
+        bar_w = 4
+        bar_gap = 3
+
+        for i, bid in enumerate(self.vu_bar_ids):
+            # Target height with natural bell-curve spectrum shaping
+            mult = self._vu_multipliers[i]
+            target_h = max(2.0, level * bar_h_max * mult * 1.5)
+
+            # Smooth decay / falloff
+            if target_h > self._vu_bars[i]:
+                self._vu_bars[i] = target_h
+            else:
+                self._vu_bars[i] = max(2.0, self._vu_bars[i] * 0.75 + target_h * 0.25)
+
+            bh = int(min(bar_h_max, max(2, self._vu_bars[i])))
+            bx1 = i * (bar_w + bar_gap) + 2
+            bx2 = bx1 + bar_w
+            by2 = 13
+            by1 = by2 - bh
+
+            fill_color = "#1E2330" if level < 0.04 else (COLOR_STATUS_LISTENING if level < 0.60 else COLOR_ACCENT_AMBER)
+            self.canvas_vu.coords(bid, bx1, by1, bx2, by2)
+            self.canvas_vu.itemconfig(bid, fill=fill_color)
 
     def _update_live_transcription(self, text: Optional[str]):
-        """Update live speech bubble and active draft line in notepad body."""
+        """Render streaming live speech transcription directly in the primary display box."""
         cleaned = (text or "").strip()
-        if hasattr(self, "lbl_live_transcription"):
+        if hasattr(self, "lbl_transcription"):
             if cleaned:
-                self.lbl_live_transcription.config(
-                    text=f'"{cleaned}..."',
-                    fg=COLOR_ACCENT_GOLD,
+                # Active speech in progress: render live stream in bright high-contrast white
+                # with streaming cursor indicator
+                self.lbl_transcription.config(
+                    text=f"{cleaned} ▍",
+                    fg=COLOR_TEXT_MAIN,
                 )
-                self.lbl_live_mic.config(fg=COLOR_STATUS_LISTENING)
+                self.lbl_mic_glyph.config(fg=COLOR_STATUS_HEARING)
+                self._set_status_pill("HEARING", COLOR_STATUS_HEARING)
+                self.card_transcription.config(highlightbackground=COLOR_ACCENT)
             else:
-                self.lbl_live_transcription.config(
-                    text="Listening for speech...",
+                if self.current_status == "LISTENING" and not self._last_committed_text:
+                    self.lbl_transcription.config(
+                        text="Listening for voice commands...",
+                        fg=COLOR_TEXT_MUTED,
+                    )
+                    self.lbl_mic_glyph.config(fg=COLOR_ACCENT)
+                    self.card_transcription.config(highlightbackground=COLOR_BORDER_SUBTLE)
+
+    def _commit_command_result(self, spoken_text: Optional[str], feedback_text: str, status: str = "EXECUTED"):
+        """Display finalized speech text and action result badge."""
+        self._last_committed_text = spoken_text or ""
+
+        # 1. Update main transcription box with finalized spoken words
+        if hasattr(self, "lbl_transcription"):
+            if spoken_text:
+                self.lbl_transcription.config(
+                    text=spoken_text,
+                    fg=COLOR_TEXT_MAIN,
+                )
+            else:
+                self.lbl_transcription.config(
+                    text="Listening for voice commands...",
                     fg=COLOR_TEXT_MUTED,
                 )
-                self.lbl_live_mic.config(fg=COLOR_ACCENT_GOLD)
+            self.card_transcription.config(highlightbackground=COLOR_BORDER_SUBTLE)
+            self.lbl_mic_glyph.config(fg=COLOR_ACCENT)
 
-        if hasattr(self, "note_text"):
-            self.note_text.config(state="normal")
+        # 2. Update action feedback badge pill
+        if hasattr(self, "lbl_action_badge") and hasattr(self, "action_pill"):
+            if status == "EXECUTED":
+                self.lbl_action_badge.config(
+                    text=f"✓  {feedback_text}",
+                    fg=COLOR_STATUS_LISTENING,
+                    bg="#0D281E",
+                )
+                self.action_pill.config(bg="#0D281E")
+            elif status == "IGNORED":
+                self.lbl_action_badge.config(
+                    text=f"—  {feedback_text}",
+                    fg=COLOR_STATUS_IGNORED,
+                    bg="#2B1115",
+                )
+                self.action_pill.config(bg="#2B1115")
+            else:
+                self.lbl_action_badge.config(
+                    text=f"•  {feedback_text}",
+                    fg=COLOR_TEXT_MAIN,
+                    bg="#181B24",
+                )
+                self.action_pill.config(bg="#181B24")
+
+        # 3. Schedule auto-fade back to idle ready prompt after 3.0 seconds
+        if self._reset_timer is not None and self.root:
             try:
-                # Remove prior draft line if present
-                if self.note_text.tag_ranges("live_draft"):
-                    self.note_text.delete("live_draft.first", "live_draft.last")
-                if cleaned:
-                    self.note_text.insert("end", f"🎙️ \"{cleaned}...\"\n", "live_draft")
-                    self.note_text.see("end")
-            except Exception as err:
-                logger.debug("Error updating live draft: %s", err)
-            finally:
-                self.note_text.config(state="disabled")
+                self.root.after_cancel(self._reset_timer)
+            except Exception:
+                pass
+        if self.root:
+            self._reset_timer = self.root.after(3000, self._fade_to_idle)
 
-    def _append_notepad_entry(self, spoken_text: Optional[str], feedback_text: str, status: str = "EXECUTED"):
-        """Append a clean, human-readable note entry into the read-only notepad, capped at 200 lines."""
-        self.note_text.config(state="normal")
-
-        # Remove prior draft line if present before committing permanent note
-        try:
-            if self.note_text.tag_ranges("live_draft"):
-                self.note_text.delete("live_draft.first", "live_draft.last")
-        except Exception:
-            pass
-
-        # Reset live speech bubble
-        if hasattr(self, "lbl_live_transcription"):
-            self.lbl_live_transcription.config(
-                text="Listening for speech...",
-                fg=COLOR_TEXT_MUTED,
-            )
-            self.lbl_live_mic.config(fg=COLOR_ACCENT_GOLD)
-
-        # Capping history: if line count > 200, delete oldest lines
-        try:
-            line_count = int(self.note_text.index("end-1c").split(".")[0])
-            if line_count > 200:
-                self.note_text.delete("1.0", "50.0")
-        except Exception:
-            pass
-
-        # Time tag
-        time_str = datetime.datetime.now().strftime("%I:%M %p")
-        self.note_text.insert("end", f"{time_str}  ", "timestamp")
-
-        # Spoken text
-        if spoken_text:
-            self.note_text.insert("end", f'"{spoken_text}"\n', "user_speech")
-        else:
-            self.note_text.insert("end", "\n")
-
-        # Result feedback
-        tag = "action_ok" if status == "EXECUTED" else "action_warn"
-        prefix = "  ✓ " if status == "EXECUTED" else "  — "
-        self.note_text.insert("end", f"{prefix}{feedback_text}\n\n", tag)
-
-        # Auto scroll to bottom & lock read-only state
-        self.note_text.see("end")
-        self.note_text.config(state="disabled")
+    def _fade_to_idle(self):
+        """Smoothly reset prompt text to idle state while keeping last feedback visible."""
+        if self.current_status in ("LISTENING", "READY"):
+            if hasattr(self, "lbl_transcription"):
+                self.lbl_transcription.config(
+                    text="Listening for voice commands...",
+                    fg=COLOR_TEXT_MUTED,
+                )
+                self.lbl_mic_glyph.config(fg=COLOR_ACCENT)
+                self.card_transcription.config(highlightbackground=COLOR_BORDER_SUBTLE)
+            if hasattr(self, "lbl_action_badge") and hasattr(self, "action_pill"):
+                self.lbl_action_badge.config(
+                    text='e.g. "volume up", "open chrome", "dim screen"',
+                    fg=COLOR_TEXT_SUBTLE,
+                    bg="#161922",
+                )
+                self.action_pill.config(bg="#161922")
+            self._last_committed_text = ""
 
     def close(self):
         """Safely destroy the overlay and terminate tray icon."""
         self._is_running = False
+        if self._reset_timer is not None and self.root:
+            try:
+                self.root.after_cancel(self._reset_timer)
+            except Exception:
+                pass
+            self._reset_timer = None
+
         if self._tray_icon:
             try:
                 self._tray_icon.stop()
