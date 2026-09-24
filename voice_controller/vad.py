@@ -7,7 +7,7 @@ fully offline via ONNX runtime on CPU (~1ms per 32ms frame).
 import logging
 import collections
 import time
-from typing import Optional
+from typing import Optional, Tuple
 import numpy as np
 import torch
 
@@ -38,30 +38,39 @@ class SileroVAD:
         self.hangover_threshold = hangover_threshold
         self.hud = hud
         self.model = None
+        self.model_ch1 = None
         self.buffer = np.array([], dtype=np.float32)
+        self.buffer_ch1 = np.array([], dtype=np.float32)
         self.consecutive_speech_frames = 0
+        self.consecutive_speech_frames_ch1 = 0
         self.is_speaking = False
-        
+
         # Telemetry & Error Tracking
         self._err_count = 0
         self._frame_probs = collections.deque(maxlen=64)
         self._last_telemetry_time = time.time()
         self.self_test_passed = False
-        
+
         self._init_model()
 
     def _init_model(self):
-        """Load the pre-trained Silero VAD ONNX model and run boot self-test."""
+        """Load the pre-trained Silero VAD ONNX models for both channels and run boot self-test."""
         try:
             from silero_vad import load_silero_vad
             self.model = load_silero_vad(onnx=True)
-            logger.info("Silero VAD ONNX model loaded successfully.")
+            try:
+                self.model_ch1 = load_silero_vad(onnx=True)
+            except Exception as e:
+                logger.warning("Could not instantiate secondary Silero channel model: %s", e)
+                self.model_ch1 = None
+            logger.info("Silero VAD ONNX model(s) loaded successfully.")
             self.run_self_test()
             self.self_test_passed = True
         except Exception as err:
             logger.critical("Silero VAD initialization or self-test failed: %s", err)
             self.self_test_passed = False
             self.model = None
+            self.model_ch1 = None
             if self.hud:
                 self.hud.update_state(status="IGNORED", feedback="Voice detector erroring")
             raise
@@ -133,102 +142,154 @@ class SileroVAD:
         return True
 
     def reset(self):
-        """Reset internal streaming state, buffer, and RNN hidden state."""
+        """Reset internal streaming state, buffers, and RNN hidden state for both channels."""
         self.buffer = np.array([], dtype=np.float32)
+        self.buffer_ch1 = np.array([], dtype=np.float32)
         self.consecutive_speech_frames = 0
+        self.consecutive_speech_frames_ch1 = 0
         self.is_speaking = False
         if self.model is not None and hasattr(self.model, "reset_states"):
             try:
                 self.model.reset_states()
             except Exception:
                 pass
+        if self.model_ch1 is not None and hasattr(self.model_ch1, "reset_states"):
+            try:
+                self.model_ch1.reset_states()
+            except Exception:
+                pass
 
-    def is_speech(self, chunk: np.ndarray, is_speaking: bool = False, hud=None) -> bool:
-        """Determine if audio chunk contains speech.
-        
-        Args:
-            chunk: 1D numpy array of float32 samples at 16kHz (typically 800 samples / 50ms).
-            is_speaking: Pipeline's current speaking state.
-            hud: Optional HUD overlay to push notifications to.
-            
+    def get_speech_probability(self, frame: np.ndarray, samplerate: int = 16000) -> float:
+        """Evaluate raw 512-sample float32 frame and return speech probability."""
+        if self.model is None or frame is None or len(frame) < 512:
+            return 0.0
+        try:
+            tensor = torch.from_numpy(np.asarray(frame[:512], dtype=np.float32))
+            return float(self.model(tensor, samplerate)[0, 0])
+        except Exception:
+            return 0.0
+
+    def evaluate_dual(
+        self,
+        ch0_chunk: np.ndarray,
+        ch1_chunk: Optional[np.ndarray] = None,
+        is_speaking: bool = False,
+        locked_channel: Optional[int] = None,
+        hud=None,
+    ) -> Tuple[bool, int, float, float]:
+        """Independently evaluate both channels for speech activity.
+
         Returns:
-            bool: True if chunk contains active speech, False otherwise.
+            (is_speech_detected, active_channel, ch0_max_prob, ch1_max_prob)
         """
         if hud is not None:
             self.hud = hud
 
         if self.model is None:
-            # Fall back to adaptive energy VAD if model failed to initialize
-            return vad_tracker.is_speech(chunk, is_speaking=is_speaking)
+            sp0 = vad_tracker.is_speech(ch0_chunk, is_speaking=is_speaking)
+            return sp0, 0, (0.8 if sp0 else 0.0), 0.0
 
+        # Evaluate Channel 0
+        sp0, p0 = self._evaluate_channel_stream(
+            ch0_chunk,
+            channel=0,
+            model=self.model,
+            buffer_attr="buffer",
+            consec_attr="consecutive_speech_frames",
+            is_speaking=is_speaking,
+        )
+
+        # Evaluate Channel 1 if provided
+        sp1, p1 = False, 0.0
+        if ch1_chunk is not None and len(ch1_chunk) > 0:
+            m1 = self.model_ch1 if self.model_ch1 is not None else self.model
+            sp1, p1 = self._evaluate_channel_stream(
+                ch1_chunk,
+                channel=1,
+                model=m1,
+                buffer_attr="buffer_ch1",
+                consec_attr="consecutive_speech_frames_ch1",
+                is_speaking=is_speaking,
+            )
+
+        if locked_channel is not None:
+            # Utterance channel lock active: channel decision is frozen
+            active_channel = locked_channel
+            speech_active = sp0 if locked_channel == 0 else sp1
+            return speech_active, active_channel, p0, p1
+
+        # Channel selection: pick channel containing speech with higher confidence
+        if sp0 and not sp1:
+            return True, 0, p0, p1
+        elif sp1 and not sp0:
+            return True, 1, p0, p1
+        elif sp0 and sp1:
+            best_ch = 0 if p0 >= p1 else 1
+            return True, best_ch, p0, p1
+        else:
+            best_ch = 0 if p0 >= p1 else 1
+            return False, best_ch, p0, p1
+
+    def _evaluate_channel_stream(
+        self,
+        chunk: np.ndarray,
+        channel: int,
+        model,
+        buffer_attr: str,
+        consec_attr: str,
+        is_speaking: bool,
+    ) -> Tuple[bool, float]:
+        """Process 512-sample frames for a single channel stream."""
         if chunk is None or len(chunk) == 0:
-            return False
+            return False, 0.0
 
-        # Accumulate samples into buffer
-        self.buffer = np.concatenate([self.buffer, chunk.astype(np.float32)])
-        speech_frame_detected = False
+        buf = getattr(self, buffer_attr)
+        buf = np.concatenate([buf, chunk.astype(np.float32)])
 
-        # Dual-check with adaptive energy tracker for quiet mic / soft speech assistance
+        speech_detected = False
+        max_prob = 0.0
+        consec = getattr(self, consec_attr)
+
         energy_speech = vad_tracker.is_speech(chunk, is_speaking=is_speaking)
 
-        # Evaluate all available 512-sample (32ms) frames
-        while len(self.buffer) >= 512:
-            frame = self.buffer[:512]
-            self.buffer = self.buffer[512:]
+        while len(buf) >= 512:
+            frame = buf[:512]
+            buf = buf[512:]
 
             try:
-                prob = float(self.model(torch.from_numpy(frame), 16000)[0, 0])
+                prob = float(model(torch.from_numpy(frame), 16000)[0, 0])
             except Exception as err:
                 self._err_count += 1
                 if self._err_count == 1 or self._err_count % 50 == 0:
-                    logger.warning(
-                        "Silero frame evaluation error #%d: %s (frame shape=%s, dtype=%s)",
-                        self._err_count,
-                        err,
-                        getattr(frame, "shape", None),
-                        getattr(frame, "dtype", None),
-                    )
-                if self._err_count > 100:
-                    logger.critical("Silero VAD error count exceeded 100! Voice detector erroring.")
-                    if self.hud:
-                        self.hud.update_state(status="IGNORED", feedback="Voice detector erroring")
+                    logger.warning("Silero frame evaluation error #%d: %s", self._err_count, err)
                 prob = 0.0
 
-            # Telemetry tracking
-            self._frame_probs.append(prob)
-            now = time.time()
-            if (now - self._last_telemetry_time) >= 2.0 and len(self._frame_probs) > 0:
-                probs_list = list(self._frame_probs)
-                p50 = float(np.percentile(probs_list, 50))
-                p95 = float(np.percentile(probs_list, 95))
-                pmax = float(np.max(probs_list))
-                logger.info(
-                    "VAD telemetry (2s): p50=%.3f p95=%.3f max=%.3f n_frames=%d",
-                    p50,
-                    p95,
-                    pmax,
-                    len(probs_list),
-                )
-                self._last_telemetry_time = now
+            if prob > max_prob:
+                max_prob = prob
+
+            if channel == 0:
+                self._frame_probs.append(prob)
 
             if is_speaking:
-                # During ongoing speech, hangover threshold prevents clipping intra-sentence pauses
                 if prob >= self.hangover_threshold or (energy_speech and prob >= 0.08):
-                    speech_frame_detected = True
+                    speech_detected = True
             else:
-                # Trigger onset when consecutive frames exceed onset threshold or 1 frame + energy speech
                 if prob >= self.onset_threshold or (energy_speech and prob >= 0.12):
-                    self.consecutive_speech_frames += 1
-                    if self.consecutive_speech_frames >= 2 or prob >= 0.40 or (energy_speech and prob >= 0.18):
-                        speech_frame_detected = True
-                        self.is_speaking = True
+                    consec += 1
+                    if consec >= 2 or prob >= 0.40 or (energy_speech and prob >= 0.18):
+                        speech_detected = True
                 else:
-                    self.consecutive_speech_frames = 0
+                    consec = 0
 
-        if is_speaking:
-            return speech_frame_detected
+        setattr(self, buffer_attr, buf)
+        setattr(self, consec_attr, consec)
 
-        return speech_frame_detected
+        return speech_detected, max_prob
+
+    def is_speech(self, chunk: np.ndarray, is_speaking: bool = False, hud=None) -> bool:
+        """Determine if audio chunk contains speech (Channel 0 compatibility wrapper)."""
+        sp, _, _, _ = self.evaluate_dual(chunk, None, is_speaking=is_speaking, hud=hud)
+        return sp
 
 
 _global_silero_vad: Optional[SileroVAD] = None

@@ -1,0 +1,25 @@
+# Bytecode & Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Temporary diagnostic & generated audio (preserve tests/fixtures)
+scratch/*.wav
+*.log
+
+# User local calibration cache
+voice_control_calib.json
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-control"
+version = "0.2.0"
+description = "High-reliability, offline Windows voice control pipeline with dual-channel speech detection, faster-whisper ASR, and semantic intent routing."
+authors = [{ name = "Voice Control Contributors" }]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "sounddevice>=0.4.6",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "torch>=2.0.0",
+    "faster-whisper>=1.0.0",
+    "onnxruntime>=1.16.0",
+    "pycaw>=20240210",
+    "screen-brightness-control>=0.23.0",
+    "pyautogui>=0.9.54",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"

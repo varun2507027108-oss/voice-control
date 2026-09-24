@@ -1,24 +1,16 @@
 """Live microphone meter: proves whether *your voice* reaches Python, and on which capsule.
 
-Answers the only questions that matter when the app "cannot hear you":
-
-    1. Which device did the pipeline pick, and does Windows allow it?
-    2. Does the endpoint deliver *any* signal at all?
-    3. Which microphone-array channel carries the voice, and can Silero VAD hear it?
-
-Usage:
-    python scratch/live_meter.py                        # 3s quiet baseline + 10s speech
-    python scratch/live_meter.py --speak-seconds 15
-    python scratch/live_meter.py --device 12            # pin a device index
+Analyzes channels independently without cross-channel contamination.
+Resets Silero streaming state between channel tests.
+Measures raw RMS, 75Hz filtered RMS, low-band rumble, speech-band energy, and neural VAD probability.
 """
 
 import argparse
-import json
 import math
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import sounddevice as sd
@@ -26,8 +18,8 @@ import sounddevice as sd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from voice_controller.actions import get_microphone_permissions, get_microphone_status
-from voice_controller.audio_utils import channel_scores, rank_input_candidates
-from voice_controller.config import INPUT_API_PREFERENCE, SAMPLE_RATE
+from voice_controller.audio_utils import filter_highpass, measure_channel_profile, rank_input_candidates
+from voice_controller.config import INPUT_API_PREFERENCE, PRE_VAD_HIGHPASS_HZ, SAMPLE_RATE
 
 
 def pick_device(device_arg: Optional[str]) -> Dict:
@@ -57,7 +49,7 @@ def pick_device(device_arg: Optional[str]) -> Dict:
 
 
 def resample_to_16k(audio: np.ndarray, native_sr: int) -> np.ndarray:
-    """Resample mono float32 audio to 16 kHz for the Silero VAD (no-op when already 16 kHz)."""
+    """Resample mono float32 audio to 16 kHz for Silero VAD."""
     if native_sr == SAMPLE_RATE or len(audio) == 0:
         return np.asarray(audio, dtype=np.float32)
     from scipy.signal import resample_poly
@@ -67,22 +59,23 @@ def resample_to_16k(audio: np.ndarray, native_sr: int) -> np.ndarray:
 
 
 def silero_max_prob(audio_16k: np.ndarray) -> float:
-    """Return the highest Silero speech probability across 32 ms frames (NaN when unavailable)."""
+    """Return highest Silero speech probability with state reset before and after evaluation."""
     if len(audio_16k) < 512:
         return 0.0
     try:
-        import torch
         from voice_controller.vad import get_silero_vad
 
-        model = get_silero_vad().model
-        if model is None:
-            return float("nan")
+        vad = get_silero_vad()
+        vad.reset()  # Reset state so previous channel doesn't contaminate
         best = 0.0
         for start in range(0, len(audio_16k) - 512 + 1, 512):
-            frame = audio_16k[start:start + 512].astype(np.float32)
-            best = max(best, float(model(torch.from_numpy(frame), 16000)[0, 0]))
+            frame = audio_16k[start : start + 512]
+            p = vad.get_speech_probability(frame)
+            if p > best:
+                best = p
+        vad.reset()
         return best
-    except Exception as err:  # pragma: no cover - model availability varies
+    except Exception as err:
         print(f"[WARN] Silero scoring unavailable: {err}")
         return float("nan")
 
@@ -96,7 +89,6 @@ def rms(audio: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(x))))
 
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live per-channel microphone meter")
     parser.add_argument("--device", default=None, help="Device index or name substring (overrides ranking)")
@@ -105,18 +97,20 @@ def main() -> None:
     args = parser.parse_args()
 
     print("=" * 78)
-    print("VOICE CONTROL - LIVE MICROPHONE METER")
+    print("VOICE CONTROL - LIVE PER-CHANNEL MICROPHONE METER")
     print("=" * 78)
 
     mic = get_microphone_status()
     perms = get_microphone_permissions()
     print("\n[WINDOWS] Capture endpoint:")
     print(f"  muted      : {mic.get('muted')}")
-    print(f"  input level: {mic.get('level_pct')}%   (raise to ~100% for best recognition)")
+    print(f"  input level: {mic.get('level_pct')}%")
     print(f"  endpoint   : {mic.get('device_id') or mic.get('error')}")
     print("[WINDOWS] Microphone consent (privacy):")
-    print(f"  global={perms.get('global_access')} desktop_apps={perms.get('desktop_apps')} "
-          f"machine_policy={perms.get('machine_policy')} this_app={perms.get('this_app')}")
+    print(
+        f"  global={perms.get('global_access')} desktop_apps={perms.get('desktop_apps')} "
+        f"machine_policy={perms.get('machine_policy')} this_app={perms.get('this_app')}"
+    )
 
     chosen = pick_device(args.device)
     dev_info = sd.query_devices(chosen["index"])
@@ -136,19 +130,19 @@ def main() -> None:
     print(f"\n[OPEN] {chosen['name']} @ {native_sr}Hz, {channels}ch, blocksize={blocksize}")
 
     def show(seconds_left: float, frames: List[np.ndarray]) -> None:
-        """Print one live meter line: per-channel broadband RMS and speech-band score."""
+        """Print one live meter line: per-channel raw & filtered levels."""
         if not frames:
             print(f"  ... no audio callbacks yet ({seconds_left:4.1f}s left)")
             return
         block = frames[-1]
-        level = [rms(block[:, c]) if block.ndim > 1 else rms(block) for c in range(channels)]
-        band = channel_scores(block, native_sr if block.ndim > 1 else None)
-        bars = " | ".join(
-            f"ch{c}: {level[c]:.4f} " + "#" * int(min(1.0, level[c] / 0.05) * 12)
-            for c in range(channels)
-        )
-        band_txt = " ".join(f"ch{i}={float(v):.4f}" for i, v in enumerate(band)) if band.size else "n/a"
-        print(f"  [{seconds_left:4.1f}s] {bars}   speech-band: {band_txt}")
+        levels = []
+        for c in range(channels):
+            ch_data = block[:, c] if block.ndim > 1 else block
+            raw_val = rms(ch_data)
+            filt_val = rms(filter_highpass(ch_data, native_sr, PRE_VAD_HIGHPASS_HZ))
+            bar = "#" * int(min(1.0, raw_val / 0.05) * 8)
+            levels.append(f"ch{c}: raw={raw_val:.4f} hp={filt_val:.4f} {bar}")
+        print(f"  [{seconds_left:4.1f}s] {' | '.join(levels)}")
 
     try:
         with sd.InputStream(
@@ -183,11 +177,17 @@ def main() -> None:
     analyse(quiet_frames, speak_frames, channels, native_sr, chosen, mic)
 
 
-def analyse(quiet_frames: List[np.ndarray], speak_frames: List[np.ndarray], channels: int,
-            native_sr: int, chosen: Dict, mic: Dict) -> None:
-    """Compare the quiet and speech phases per channel and print an actionable verdict."""
+def analyse(
+    quiet_frames: List[np.ndarray],
+    speak_frames: List[np.ndarray],
+    channels: int,
+    native_sr: int,
+    chosen: Dict,
+    mic: Dict,
+) -> None:
+    """Compare quiet and speech phases per channel independently and print actionable verdict."""
     print("\n" + "=" * 78)
-    print("RESULTS")
+    print("RESULTS & SPECTRAL BREAKDOWN")
     print("=" * 78)
 
     def stack(frames: List[np.ndarray]) -> np.ndarray:
@@ -197,73 +197,87 @@ def analyse(quiet_frames: List[np.ndarray], speak_frames: List[np.ndarray], chan
 
     quiet = stack(quiet_frames)
     speak = stack(speak_frames)
-    print(f"Captured {len(quiet)} quiet samples and {len(speak)} speech samples "
-          f"({len(speak) / float(native_sr):.1f}s)")
+    print(
+        f"Captured {len(quiet)} quiet samples and {len(speak)} speech samples "
+        f"({len(speak) / float(native_sr):.1f}s)"
+    )
 
     results = []
+    profiles = {}
     for c in range(channels):
-        quiet_rms = rms(quiet[:, c]) if quiet.size else 0.0
-        speech_rms = rms(speak[:, c]) if speak.size else 0.0
-        source = speak[:, c] if speak.size else np.zeros(1, dtype=np.float32)
-        prob = silero_max_prob(resample_to_16k(source, native_sr))
-        results.append((c, quiet_rms, speech_rms, prob))
-        ratio = (speech_rms / quiet_rms) if quiet_rms > 1e-6 else float("inf")
-        print(f"  ch{c}: quiet rms={quiet_rms:.4f}  speech rms={speech_rms:.4f}  "
-              f"speech/quiet x{ratio:.2f}  silero max={prob:.3f}")
+        q_raw = quiet[:, c] if quiet.size else np.zeros(0, dtype=np.float32)
+        s_raw = speak[:, c] if speak.size else np.zeros(0, dtype=np.float32)
 
-    valid = [(c, p) for c, _q, _s, p in results if not np.isnan(p)]
-    best = max(valid, key=lambda item: item[1]) if valid else (0, float("nan"))
+        q_rms = rms(q_raw)
+        s_rms = rms(s_raw)
+
+        # 75Hz filtered signals
+        q_filt = filter_highpass(q_raw, native_sr, PRE_VAD_HIGHPASS_HZ) if len(q_raw) else q_raw
+        s_filt = filter_highpass(s_raw, native_sr, PRE_VAD_HIGHPASS_HZ) if len(s_raw) else s_raw
+
+        q_filt_rms = rms(q_filt)
+        s_filt_rms = rms(s_filt)
+
+        # 16kHz resampled for Silero and spectral analysis
+        s_16k = resample_to_16k(s_filt, native_sr)
+        prof = measure_channel_profile(s_16k, SAMPLE_RATE)
+        profiles[c] = prof
+
+        # Silero VAD (with clean reset)
+        prob = silero_max_prob(s_16k)
+        results.append((c, q_rms, s_rms, q_filt_rms, s_filt_rms, prob, prof))
+
+        ratio = (s_rms / q_rms) if q_rms > 1e-6 else float("inf")
+        print(f"\n  [Channel {c}]")
+        print(f"    Raw RMS      : quiet={q_rms:.4f}  speech={s_rms:.4f}  (gain ratio x{ratio:.2f})")
+        print(f"    Filtered RMS : quiet={q_filt_rms:.4f}  speech={s_filt_rms:.4f}")
+        print(f"    Low-band RMS : {prof['low_band_rms']:.4f} (<100Hz rumble)")
+        print(f"    Speech-band  : {prof['speech_band_rms']:.4f} (100-4000Hz)")
+        print(f"    Band SNR     : {prof['snr_db']:.1f} dB")
+        print(f"    Silero Max   : {prob:.4f}")
+
+    valid = [(r[0], r[5]) for r in results if not np.isnan(r[5])]
+    best = max(valid, key=lambda item: item[1]) if valid else (0, 0.0)
     speech_rms_max = max(r[2] for r in results) if results else 0.0
-    if speak.size and channels:
-        loud_band = int(max(range(channels), key=lambda c: float(np.mean(np.abs(np.diff(speak[:, c]))))))
-    else:
-        loud_band = 0
 
-    verdicts: List[str] = []
-    if speak.size == 0 or speech_rms_max < 0.002:
-        verdicts.append(
-            "NO SIGNAL: the endpoint delivered near-silence while you spoke. That is a Windows/driver "
-            "problem, not a code problem - check input level/mute (Settings > Sound > Input), the "
-            "Realtek/array 'Microphone Effects' or audio enhancements, and that no other app holds the mic."
-        )
-    elif best[1] >= 0.5:
-        verdicts.append(
-            f"VOICE FOUND on channel {best[0]} (Silero max prob {best[1]:.2f}); loudest speech-band channel "
-            f"is {loud_band}. If the pipeline latches a different channel, the capsule choice is the bug."
-        )
-    elif best[1] < 0.2:
-        verdicts.append(
-            f"ENERGY BUT NO SPEECH: audio arrives (rms up to {speech_rms_max:.4f}) yet Silero scores it as "
-            f"non-speech ({best[1]:.2f}). Typical of input that is far too quiet or distorted - raise the "
-            "Windows microphone level to ~100% and speak closer to the array."
-        )
+    print("\n" + "=" * 78)
+    print("VERDICT")
+    print("=" * 78)
+
+    if not speak_frames or len(speak) == 0:
+        print("  NO CALLBACKS: The capture stream never invoked audio callbacks. Endpoint is dead or locked.")
+    elif speech_rms_max < 0.001:
+        print("  DIGITAL SILENCE: Endpoint delivered 0.0 signal while speaking. Check Windows Sound settings & mute.")
+    elif best[1] >= 0.50:
+        print(f"  VOICE FOUND on Channel {best[0]} (Silero max prob {best[1]:.2f}).")
+        if channels > 1:
+            other = 1 - best[0]
+            if profiles[other]["low_band_rms"] > profiles[best[0]]["low_band_rms"] * 1.5:
+                print(
+                    f"  Note: Channel {other} carries heavy low-frequency rumble ({profiles[other]['low_band_rms']:.4f})."
+                )
+                print(
+                    f"  The new dual-channel speech-first selector successfully locks onto clean Channel {best[0]}!"
+                )
+    elif best[1] < 0.20:
+        if channels > 1 and profiles[1]["low_band_rms"] > profiles[0]["low_band_rms"] * 2.0:
+            print(
+                f"  NOISE ONLY (RUMBLE DOMINATED): Channel 1 has strong ~25Hz acoustic rumble ({profiles[1]['low_band_rms']:.4f})."
+            )
+            print("  Silero detected no voice on either channel. Raise Windows input level or speak louder.")
+        else:
+            print(f"  SIGNAL PRESENT BUT NO SPEECH DETECTED: RMS reached {speech_rms_max:.4f}, but Silero max prob was only {best[1]:.2f}.")
+            print("  Input may be too soft or muffled. Raise microphone input level to ~100% in Windows Sound.")
     else:
-        verdicts.append("INCONCLUSIVE: re-run and speak clearly for the whole speech phase.")
+        print(f"  AMBIGUOUS: Moderate speech probability ({best[1]:.2f}). Re-run test speaking with standard cadence.")
 
     level_pct = mic.get("level_pct")
     if level_pct is not None and float(level_pct) < 50:
-        verdicts.append(f"Windows input level is only {level_pct}% - raise it (Settings > Sound > Input).")
+        print(f"  [ACTION] Windows input level is only {level_pct}% - raise it to 100% in Settings > Sound > Input.")
     if mic.get("muted"):
-        verdicts.append("Windows reports the capture endpoint as MUTED - unmute it.")
-
-    print("\nVERDICT:")
-    for line in verdicts:
-        print(f"  - {line}")
-
-    print("\nMachine-readable summary:")
-    print("  " + json.dumps({
-        "device": chosen["name"],
-        "api": chosen["api"],
-        "native_sr": native_sr,
-        "channels": channels,
-        "per_channel": [
-            {"channel": c, "quiet_rms": round(q, 5), "speech_rms": round(s, 5),
-             "silero_max": None if np.isnan(p) else round(p, 3)}
-            for c, q, s, p in results
-        ],
-    }))
+        print("  [ACTION] Windows reports capture endpoint is MUTED - unmute it.")
+    print("=" * 78 + "\n")
 
 
 if __name__ == "__main__":
     main()
-

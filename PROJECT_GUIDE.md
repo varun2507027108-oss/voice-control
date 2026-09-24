@@ -10,9 +10,14 @@ The system provides hands-free Windows desktop control through real-time speech 
 
 ### Key Highlights
 - **100% Offline & Local**: No audio data or transcripts ever leave your local computer.
-- **Hardware-Accelerated ASR**: Runs `UsefulSensors/moonshine-tiny` on CUDA with `float16` precision using your NVIDIA GPU.
-- **Fast Intent Routing**: Categorizes complex natural language voice commands in **~41ms** using `laya.Router`.
-- **Zero-Flicker macOS Desktop Notepad**: A borderless, draggable, always-on-top window styled after the native macOS Notes application, featuring traffic light window controls (🔴 🟡 🟢), clean typography, and non-technical, human-readable status feedback.
+- **Hardware-Accelerated ASR**: Runs `faster-whisper` (`small.en`) on CUDA with `float16` precision using your NVIDIA GPU (with graceful CPU fallback).
+- **Speech-Aware Dual-Channel Architecture**: Independent per-channel preprocessing and dual-instance Silero neural VAD. Resolves hardware asymmetries where one microphone capsule carries severe low-frequency rumble (e.g. 21–29 Hz Realtek laptop array rumble) while the other carries clean acoustic voice.
+- **Utterance-Level Channel Locking**: Once speech onset is confirmed, the system locks onto the speech-bearing capsule for the entirety of the spoken utterance, preventing channel flapping mid-phrase.
+- **Clean Real-Time Audio Separation**: PortAudio callback performs *only* sample copy into a bounded queue. Heavy filtering, resampling, VAD inference, and GUI updates are decoupled onto dedicated worker threads to guarantee zero PortAudio underruns.
+- **Safe STT Priority Concurrency**: Dedicated single STT worker with non-blocking priority locks. Live partial preview yields immediately when a final utterance arrives.
+- **Safe App Allowlist**: Strict executable whitelist (`SAFE_APP_WHITELIST`) prevents arbitrary shell execution from transcribed voice input.
+- **Fast Intent Routing**: Categorizes complex natural language voice commands in **~40ms** using `laya.Router`.
+- **Zero-Flicker macOS Desktop Notepad**: A borderless, draggable, always-on-top window styled after the native macOS Notes application, featuring traffic light window controls (🔴 🟡 🟢), clean typography, and non-technical status feedback.
 
 ---
 
@@ -20,19 +25,19 @@ The system provides hands-free Windows desktop control through real-time speech 
 
 | Layer | Technology | Version | Role / Purpose |
 |---|---|---|---|
-| **Runtime** | Python | `3.11.9` | Primary execution runtime |
+| **Runtime** | Python | `>=3.11, <3.14` | Primary execution runtime (Python 3.11 / 3.13 supported) |
 | **Compute / Acceleration** | PyTorch (`torch`) | `2.6.0+cu124` | CUDA-accelerated tensor operations & neural inference |
-| **Hardware Device** | NVIDIA GeForce RTX 3050 Laptop GPU | 6 GB VRAM | GPU target for Whisper/Moonshine FP16 inference |
-| **Speech-to-Text (STT)** | `faster-whisper` (CTranslate2) | `1.2.x` | GPU/CPU ASR runtime for the `small.en` Whisper model |
+| **Hardware Device** | NVIDIA GeForce RTX 3050 Laptop GPU | 6 GB VRAM | GPU target for Whisper FP16 inference |
+| **Speech-to-Text (STT)** | `faster-whisper` (CTranslate2) | `1.2.x` | High-throughput GPU/CPU ASR runtime for `small.en` |
 | **Model ID** | `small.en` (Whisper) | Pretrained | English ASR model, FP16 on CUDA / INT8 on CPU |
-| **Neural VAD** | `silero-vad` (ONNX) | `6.x` | Offline neural speech boundary detection (~1ms / 32ms frame) |
+| **Neural VAD** | `silero-vad` (ONNX) | `6.x` | Offline dual-session neural speech boundary detection (~1ms / 32ms frame) |
 | **Intent Categorization** | `laya` | `0.1.x` | Ultra-fast local semantic router with sub-42ms latency |
-| **Audio Capture** | `sounddevice` | `0.5.x` | PortAudio wrapper capturing 16kHz mono audio streams |
-| **Audio Processing** | `numpy` | `2.x` | Buffer management, normalization, and RMS energy VAD |
+| **Audio Capture** | `sounddevice` | `0.5.x` | PortAudio wrapper capturing native WASAPI audio streams |
+| **Signal Processing** | `scipy.signal`, `numpy` | Latest | 75 Hz high-pass rumble filter, polyphase resampler, SNR profiling |
 | **Windows Audio** | `pycaw` | `20251023` | Core Audio Windows API wrapper for master endpoint volume control |
 | **Display Control** | `screen_brightness_control`| Latest | Multi-monitor display brightness adjustment via WMI/VCP |
 | **Input & Media** | `pyautogui` | Latest | Virtual keystroke injection for media controls (`playpause`, `nexttrack`, etc.) |
-| **OS Security & Execution** | `ctypes`, `subprocess` | Standard Lib | Calling `user32.LockWorkStation` and detached process execution |
+| **OS Security & Execution** | `ctypes`, `subprocess` | Standard Lib | Calling `user32.LockWorkStation` and allowlisted process execution |
 | **GUI & Overlay** | `tkinter` | Standard Lib | Native OS windowing with transparency (`-alpha`) and topmost ordering |
 
 ---
@@ -43,19 +48,27 @@ The system provides hands-free Windows desktop control through real-time speech 
 c:\Users\varun\voice control\
 ├── voice_controller/                 # Core Python package
 │   ├── __init__.py                   # Package initialization and exports
-│   ├── config.py                     # Central configuration (audio, VAD, styling tokens)
-│   ├── audio_utils.py                # Device ranking, loudest-channel downmix, level normalization
-│   ├── engine_stt.py                 # faster-whisper ASR engine running on CUDA FP16
+│   ├── config.py                     # Central configuration (audio, VAD thresholds, styling)
+│   ├── audio_utils.py                # Preprocessor, 75Hz highpass filter, channel selector, profiles
+│   ├── vad.py                        # Dual-instance Silero VAD (isolated ONNX sessions per channel)
+│   ├── engine_stt.py                 # faster-whisper ASR engine (priority lock, structured SttResult)
 │   ├── engine_intent.py              # Laya semantic router with custom guardrails
-│   ├── actions.py                    # Windows automation dispatchers (pycaw, brightness, apps)
+│   ├── actions.py                    # Windows automation dispatchers & strict application allowlist
 │   ├── overlay.py                    # Transparent macOS-style Notepad HUD overlay
-│   └── main.py                       # Pipeline orchestrator (Audio Stream -> VAD -> STT -> Laya -> Action)
+│   └── main.py                       # Pipeline orchestrator & worker threads
 ├── tests/
-│   ├── test_pipeline.py              # Comprehensive integration test suite (22/22 test cases)
+│   ├── fixtures/
+│   │   └── open_chrome_16k.wav       # Real speech test fixture (mono 16kHz float32)
+│   ├── test_pipeline.py              # Subsystem unit & integration tests (25 test cases)
+│   ├── test_audio_pipeline.py        # End-to-end audio pipeline, rumble rejection & security tests
 │   └── test_heldout.py               # Held-out semantic generalization / fail-closed suite
 ├── scratch/
-│   └── diagnose_mic.py               # Microphone health diagnostic (per-device RMS / channel probe)
-├── PROJECT_GUIDE.md                  # Complete technical architecture and implementation guide
+│   ├── live_meter.py                 # Real-time per-channel diagnostic & hardware vs software verdict
+│   ├── channel_probe.py              # Dual-channel spectral/energy inspection (no np.mean downmix)
+│   └── level_meter.py                # Real-time per-channel CLI VU meter with 75 Hz filtering
+├── requirements.txt                  # Pinned dependency requirements
+├── pyproject.toml                    # Standard Python project metadata & pytest configuration
+└── PROJECT_GUIDE.md                  # Complete technical architecture and implementation guide
 ```
 
 ---
@@ -64,39 +77,41 @@ c:\Users\varun\voice control\
 
 ```mermaid
 flowchart TD
-    subgraph AudioPipeline["1. Audio Ingestion & VAD"]
-        Mic["Microphone"] -->|16kHz 16-bit Mono| SD["sounddevice.InputStream"]
-        SD -->|50ms Chunks| VAD["Energy VAD (RMS Threshold = 0.015)"]
-        VAD -->|Realtime Audio Level| HUD_Meter["Notepad Mic Indicator"]
-        VAD -->|Silence >= 0.8s| SpeechBuffer["Speech Buffer Aggregator"]
+    subgraph AudioCapture["1. Real-Time Audio Capture"]
+        Mic["Microphone Array (Realtek 2-ch)"] -->|Native WASAPI (e.g. 48kHz Stereo)| SD["sounddevice.InputStream"]
+        SD -->|Callback Copy Only| RawQueue["Bounded Audio Queue (maxsize=25)"]
     end
 
-    subgraph STTLayer["2. Speech Recognition (ASR)"]
-        SpeechBuffer -->|Normalized Float32 Audio| STT["UsefulSensors/moonshine-tiny"]
-        STT -->|CUDA FP16 Inference| RawText["Transcribed Utterance"]
+    subgraph AudioWorker["2. Audio Worker & Dual-Channel VAD"]
+        RawQueue --> PreProc0["CH0: DC removal + HP 75Hz + Resample 16kHz"]
+        RawQueue --> PreProc1["CH1: DC removal + HP 75Hz + Resample 16kHz"]
+        PreProc0 --> Silero0["Silero VAD Session 0"]
+        PreProc1 --> Silero1["Silero VAD Session 1 (Isolated State)"]
+        Silero0 --> Decision{"Speech Confirmed?"}
+        Silero1 --> Decision
+        Decision -->|Lock Channel for Utterance| SpeechBuf["Utterance Speech Buffer"]
+        Decision -->|Trailing Silence >= 0.8s| Flush["Flush Utterance & Unlock Channel"]
     end
 
-    subgraph IntentLayer["3. Semantic Routing & Disambiguation"]
-        RawText --> Laya["laya.Router(preload=True)"]
+    subgraph STTLayer["3. Speech Recognition (ASR Worker)"]
+        Flush --> STTQueue["STT Priority Queue"]
+        STTQueue --> STTLock{"Inference Lock (Final > Live Partial)"}
+        STTLock --> Whisper["faster-whisper (small.en, CUDA FP16)"]
+        Whisper --> SttRes["Structured SttResult (quality, safe_for_execution)"]
+    end
+
+    subgraph IntentLayer["4. Semantic Routing & Execution Safety"]
+        SttRes -->|safe_for_execution == True| Laya["laya.Router(preload=True)"]
         Laya --> Guardrails["Context Guardrails (Display vs Audio)"]
-        Guardrails --> Decision{"Confidence >= 0.75 & Valid Action?"}
+        Guardrails --> AllowlistCheck{"Allowlist & Security Valid?"}
+        AllowlistCheck -->|Allowed App / Action| Dispatch["actions.execute(action)"]
+        AllowlistCheck -->|Blocked / Unrecognized| RejectionNotice["Display Safe Feedback"]
     end
 
-    subgraph ActionLayer["4. Windows Automation Dispatcher"]
-        Decision -->|Yes| Dispatch["actions.execute(action)"]
-        Dispatch --> Vol["Master Volume (pycaw)"]
-        Dispatch --> Bright["Brightness (screen_brightness_control)"]
-        Dispatch --> Media["Media Controls (pyautogui)"]
-        Dispatch --> Apps["Spawn Apps (subprocess: Chrome, Terminal, VS Code)"]
-        Dispatch --> Lock["Lock Screen (ctypes user32)"]
-        Decision -->|No| Skip["Ignore Unrecognized / Low Conf"]
-    end
-
-    subgraph UILayer["5. macOS-Themed Desktop Notepad"]
+    subgraph UILayer["5. macOS-Themed Desktop Notepad HUD"]
         Dispatch -->|Success Notice| NoteLog["Notepad Note Entry"]
-        Skip -->|Notice| NoteLog
-        RawText -->|Live Spoken Text| NoteLog
-        HUD_Meter --> TopBar["macOS Titlebar (🔴 🟡 🟢)"]
+        RejectionNotice --> NoteLog
+        SttRes -->|Live Partial / Final Text| NoteLog
     end
 ```
 
@@ -104,60 +119,34 @@ flowchart TD
 
 ## 5. Subsystem Deep Dives
 
-### 5.1. Audio Stream & Voice Activity Detection (VAD)
-- **Device Selection**: `rank_input_candidates()` orders real **WASAPI → MME → DirectSound** endpoints, excludes WDM-KS, demotes PortAudio pseudo-devices (`Primary Sound Capture Driver`, `Sound Mapper`) and can be pinned with `VOICE_CONTROL_DEVICE=<index|name>`.
-- **Liveness Probe**: Every candidate is opened for a 0.4s capture before selection; endpoints returning digital silence are rejected instead of being silently chosen.
-- **Channel Downmix**: `select_channel()` captures the **loudest microphone-array capsule** with 25% hysteresis instead of `np.mean(axis=1)`. On the target Realtek array capsule 0 measures ~4x quieter than capsule 1, so averaging discarded ~6 dB of voice (and would fully cancel phase-inverted capsules).
-- **Sample Rate**: native hardware rate (e.g. 48,000 Hz) captured, then polyphase-resampled to **16,000 Hz** mono in 50 ms (800-sample) chunks.
-- **Voice Detection**: Silero VAD ONNX neural detector (2-frame onset at p > 0.50, hangover at p ≥ 0.35) with an RMS-energy `AdaptiveVAD` fallback that tracks the ambient noise floor bidirectionally.
-- **Utterance Boundaries**: `SILENCE_DURATION = 0.8s` trailing silence closes an utterance, `MIN_SPEECH_DURATION = 0.35s` discards blips, and `MAX_SPEECH_DURATION_S = 6s` force-slices continuous noise.
-- **Stream Self-Healing**: A watchdog detects stalled/inactive PortAudio streams and re-opens the capture stream automatically (rate-limited to once per 5s).
+### 5.1. Audio Stream & Real-Time Audio Callback
+- **Copy-Only Callback**: The PortAudio callback in `voice_controller/main.py` performs *only* `raw_audio_queue.put_nowait(indata.copy())`. It does not resample, does not run neural inference, does not score channels, and does not perform GUI calls. If the queue fills up during system lag, the oldest block is dropped with telemetry logged.
+- **Device Selection**: `rank_input_candidates()` orders **WASAPI → MME → DirectSound** endpoints, excludes WDM-KS, demotes PortAudio pseudo-devices (`Primary Sound Capture Driver`), and respects `VOICE_CONTROL_DEVICE=<index|name>`.
+- **Verified Stream Guarantee**: Opens exactly one production stream and verifies real callbacks and audio health. If no valid endpoint works, the system displays an explicit **NO MICROPHONE** state rather than silently running with a dead fallback.
 
-### 5.2. Speech-to-Text Engine (`engine_stt.py`)
-- **Model**: `UsefulSensors/moonshine-tiny` loaded via Hugging Face `AutoProcessor` and `AutoModelForSpeechSeq2Seq`.
-- **Target Device**: `cuda:0` (`NVIDIA GeForce RTX 3050 Laptop GPU`).
-- **Precision**: `torch.float16` for reduced VRAM footprint (<500MB) and accelerated tensor core compute.
-- **Input Preprocessing**: Converts variable-length 1D float32 numpy arrays directly to PyTorch tensors without artificial zero-padding padding overhead, ensuring near-instant transcription turnaround.
+### 5.2. Two-Channel Speech Detection & Rumble Rejection
+- **Rumble Elimination**: On the target Realtek hardware, channel 1 carries intense 21–29 Hz mechanical/fan rumble (+24 dB energy) while channel 0 is acoustic voice. The `ChannelPreprocessor` applies a 75 Hz high-pass Butterworth filter and removes DC before VAD, completely eliminating low-frequency domination.
+- **Speech-First Selection**: Speech detection runs *before* channel selection. Dual-instance Silero VAD evaluates both channels independently. The capsule containing confirmed speech is chosen.
+- **Utterance-Level Locking**: Once speech onset is detected, `DualChannelSpeechSelector` locks that channel for the entire utterance. Channel flapping is impossible.
 
-### 5.3. Semantic Intent Routing (`engine_intent.py`)
-- **Engine**: `laya.Router(preload=True)` with pre-embedded intent criteria.
-- **Inference Speed**: **38ms – 42ms** per classification on CPU/GPU.
-- **Categorization Schema**:
-  1. `open_browser`: Launch Chrome or Edge.
-  2. `open_terminal`: Launch Windows Terminal or PowerShell.
-  3. `open_editor`: Launch Visual Studio Code or Notepad.
-  4. `volume_up`: Increase master system audio.
-  5. `volume_down`: Lower system volume.
-  6. `volume_mute`: Toggle mute state.
-  7. `brightness_up`: Increase display backlight.
-  8. `brightness_down`: Dim display backlight.
-  9. `media_play_pause`: Play or pause active media player.
-  10. `media_next`: Skip to next song/video.
-  11. `media_prev`: Return to previous song/video.
-  12. `lock_workstation`: Secure and lock Windows.
-  13. `unrecognized`: Out-of-domain commands.
-- **Guardrails**: Includes semantic keyword checks to disambiguate overlapping phrases (e.g. ensuring *"dim the screen"* routes to `brightness_down` rather than audio mute, and *"quieter"* routes cleanly to `volume_down`).
+### 5.3. Speech-to-Text Engine (`engine_stt.py`)
+- **Model**: `faster-whisper` `small.en` loaded on `cuda:0` with `float16` precision (CPU INT8 fallback).
+- **Concurrency & Priority**: A non-blocking `_inference_lock` coordinates final utterance transcription and live partial drafts. When final speech arrives, live partial jobs immediately yield and drop, preventing model corruption or contention.
+- **Structured Evaluation**: Returns `SttResult` with `text`, `quality_score`, `speech_detected`, and `safe_for_execution`. If speech is too quiet or noisy, the user receives clear diagnostic feedback ("Too quiet", "Low audio quality") instead of a generic "Didn't catch that".
+- **Zero Cache Churn**: Removed routine `torch.cuda.empty_cache()` calls from inference hot paths, keeping GPU memory resident and avoiding driver allocation pauses.
 
-### 5.4. Windows Automation Engine (`actions.py`)
-- **Audio Control**: Uses `pycaw.pycaw.AudioUtilities` to query the default playback audio endpoint and adjusts `EndpointVolume` in calibrated 10% steps.
-- **Brightness**: Uses `screen_brightness_control.set_brightness()` with multi-monitor detection and bound-checking (0%–100%).
-- **Application Execution**: Employs non-blocking `subprocess.Popen` with OS fallback chains (e.g. `chrome.exe` $\rightarrow$ `msedge.exe`, `wt.exe` $\rightarrow$ `powershell.exe`, `code.cmd` $\rightarrow$ `notepad.exe`).
-- **Media Controls**: Dispatches virtual scan codes (`playpause`, `nexttrack`, `prevtrack`) via `pyautogui`.
-- **Workstation Security**: Executes `ctypes.windll.user32.LockWorkStation()` for instant lock.
+### 5.4. Application Execution & Allowlist Security (`actions.py`)
+- **Safe Application Allowlist**: Replaced arbitrary executable launching with `SAFE_APP_WHITELIST`. Only authorized applications (e.g. `chrome`, `edge`, `terminal`, `powershell`, `vscode`, `notepad`, `calculator`, `explorer`, `spotify`, `settings`) can be launched. Arbitrary recognized phrases cannot execute arbitrary commands.
+- **Windows Automation**: Master volume via `pycaw`, brightness via `screen_brightness_control`, media controls via `pyautogui`, and workstation locking via `ctypes.windll.user32.LockWorkStation`.
+- **Mic Gain Safety**: `AUTO_FIX_MIC_LEVEL` defaults to `False`. The system inspects and diagnoses Windows mic volume without modifying user sound settings without explicit opt-in (`VOICE_CONTROL_AUTO_FIX_MIC=1`).
 
 ### 5.5. macOS-Themed Notepad Overlay (`overlay.py`)
-- **Visual Design**:
+- **Design & Layout**:
   - Borderless window (`overrideredirect(True)`) with subtle window alpha (`-alpha 0.88`).
   - Dark mode color palette (`#1E1E22` body, `#2A2A2E` header bar).
-  - Authentic macOS traffic light window controls:
-    - 🔴 **Red (`#FF5F57`)**: Clean application exit.
-    - 🟡 **Yellow (`#FEBC2E`)**: Window minimize.
-    - 🟢 **Green (`#28C840`)**: Window size reset.
-  - Typography: Clean macOS sans-serif font stack (`Segoe UI`, `SF Pro`, `Helvetica Neue`).
-- **State Machine**:
-  1. **Loading State**: Displays a clean, non-technical card: *"Starting Voice Engine..."* with a subtle animated progress bar while models load into VRAM.
-  2. **Active Notepad State**: Displays a clean notepad page where speech entries are naturally logged, alongside human-friendly confirmations (e.g. `✓ Volume set to 50%`).
-- **Threading & Safety**: Runs Tkinter's event loop on the main thread while background audio capture and inference threads communicate state updates asynchronously via `queue.Queue`.
+  - Authentic macOS traffic light window controls (🔴 Minimize, 🟡 Hide, 🟢 Reset).
+  - Clean macOS sans-serif font stack (`Segoe UI`, `SF Pro`, `Helvetica Neue`).
+- **Throttled Updates**: VU meter updates are coalesced and throttled (`HUD_UPDATE_INTERVAL_S = 0.05`), ensuring the Tkinter event loop remains responsive.
 
 ---
 
@@ -181,78 +170,32 @@ flowchart TD
 
 ---
 
-## 7. Execution & Verification
+## 7. Execution & Diagnostics
 
 ### Running the System
 ```powershell
 python -m voice_controller.main
 ```
 
-### Running the Subsystem Test Suite
+### Running the Complete Test Suite
 ```powershell
-python -u tests/test_pipeline.py
+python -m pytest tests/
 ```
-*(All 22 test cases pass: 20 intent/audio/action suites plus held-out evaluation; Silero VAD, faster-whisper CUDA FP16 transcription, device ranking, channel selection and level normalization are all covered).*
+Runs both unit/pipeline tests and end-to-end audio pipeline tests (real WAV fixture execution, dual-channel rumble rejection, utterance locking, phase-inversion protection, bounded queue overflow, STT concurrency priority, and application allowlist security).
 
-### Diagnosing "It can't hear my voice"
-```powershell
-python scratch/diagnose_mic.py            # per-device RMS/peak, channel balance, dead-endpoint check
-python scratch/diagnose_mic.py --speak    # speak when prompted to confirm the recommended device hears you
-```
-
----
-
-## 8. Microphone Troubleshooting & Audio Robustness
-
-The pipeline previously failed silently when the auto-selected capture endpoint delivered no voice.
-The root causes found on the target Windows machine (Realtek stereo array) and their fixes:
-
-| Symptom | Root cause | Fix shipped |
-|---|---|---|
-| Device opened fine but only silence was captured | DirectSound pseudo-device `Primary Sound Capture Driver` was ranked first (`DIRECTSOUND → WASAPI → MME`) | WASAPI-first ranking, pseudo-devices demoted to fallback, `VOICE_CONTROL_DEVICE` override |
-| Voice energy ~6 dB weaker than the microphone actually delivered | `np.mean(indata, axis=1)` averaged capsule 0 (measured ~4x quieter) with capsule 1 | `select_channel()` latches onto the loudest capsule with 25% hysteresis; phase-inverted arrays no longer cancel |
-| Quiet commands rejected as "Didn't catch that" | Whisper `avg_logprob > -0.8` gate rejected soft-but-correct speech | `avg_logprob > -1.0`, thresholds moved to `config.py`, utterance RMS logged with every rejection |
-| Low Windows mic gain / mute | Invisible to PortAudio (stream opens, captures silence) | `actions.get_microphone_status()` checks mute + level at boot and warns in the HUD/log |
-| App went permanently deaf after a driver hiccup | Watchdog only logged the stall | Watchdog now re-opens the capture stream (rate-limited) |
-| A callback exception killed the stream silently | Callback body was unguarded; `resample_poly` was imported *inside* the realtime callback | Callback wrapped in try/except with error counter; resampler imported once at module load |
-
-### Findings from the live troubleshooting session (channel / consent / silence)
-
-Measured on the target machine while the user reported "still not able to hear what I am saying":
-
-| Observation | Meaning | What was changed |
-|---|---|---|
-| Consent store: `global=Allow`, `desktop_apps=Allow`, `machine_policy=Allow`; endpoint not muted; level 27.5% | **No Windows privacy restriction is blocking capture** | `actions.get_microphone_permissions()` logs the real registry state at boot so a blocked app can never be mistaken for a broken mic |
-| `ch0` and `ch1` correlate at **-0.005** | Not a stereo pair: `ch1` is a hiss/DC-drift dominated reference channel (3.4x more broadband energy, 8x more in-band noise, large 0-3 Hz drift) | Capsule choice no longer uses broadband RMS |
-| Both capsules sat within ~1.12-1.25x of each other in speech-band energy | The old "loudest block wins" rule **flapped** between ch0 and ch1 every few seconds | `ChannelScorer` scores a capsule by how far it rises above *its own* hiss floor (running SNR) with asymmetric floor adaptation |
-| Ambient auto-sample failed twice with `PaErrorCode -9999 / GetNameFromCategory: usbTerminalGUID = 9324` | Only the *extra* calibration stream fails; the main stream opens fine | Sampler retries once, calibrates on the capsule the pipeline uses, and warns instead of failing silently |
-| `VAD telemetry` prints Silero **speech probabilities**, not audio level (max 0.055 over 34s = nothing speech-like was seen) | A quiet telemetry line is not proof of a dead mic | New `Capture level (2s): rms p50/p95/max/peak ... ch=N` line separates "endpoint delivers silence" from "VAD disagrees" |
-| A shared-mode stream can open, report `active`, and deliver **pure zeros** | Silent-but-healthy stream state | `_verify_live_capture()` proves audio at boot; the watchdog restarts a stream that stays digitally silent for >3s (max 5 times) |
-| `sd.rec()` + `sd.play()` together produced an all-zero capture in testing, while explicit `InputStream`/`OutputStream` scenarios (single, back-to-back, full-duplex, playback mid-stream) all captured normally | The endpoint is healthy; stream churn and full-duplex are **not** the problem | `scratch/silence_probe.py` reproduces all four scenarios for future regressions |
-
-### Quick manual checks
-1. **Live proof (run this first when "it can't hear me")**:
+### Diagnostic Suite (`scratch/`)
+1. **`scratch/live_meter.py`**:
+   Comprehensive 3s ambient quiet baseline followed by 10s speech capture. Analyzes both channels independently with isolated Silero VAD state resets, reports SNR and spectral balance, and provides an authoritative hardware vs. software verdict.
    ```powershell
-   python scratch/live_meter.py                 # 3s quiet baseline, then speak for 10s
+   python scratch/live_meter.py
    ```
-   Prints per-channel quiet/speech RMS, Silero probability per channel, the Windows level/mute and
-   privacy state, and a verdict (`VOICE FOUND on channel N` / `NO SIGNAL` / `ENERGY BUT NO SPEECH`).
-2. **Windows level**: Settings → System → Sound → Input → *Microphone (Realtek)* → volume near 100%, microphone not muted, "Microphone Boost" enabled if available. To let the app do it for you (opt-in):
+2. **`scratch/channel_probe.py`**:
+   Captures multi-channel audio and compares raw RMS, 75 Hz filtered RMS, speech-band RMS (100 Hz–4 kHz), and low-band rumble (<100 Hz) without any destructive downmixing.
    ```powershell
-   $env:VOICE_CONTROL_MIC_LEVEL = "100"          # sets the Windows input slider at boot
-   python -m voice_controller.main
+   python scratch/channel_probe.py
    ```
-3. **Privacy**: Settings → Privacy & security → Microphone → *Microphone access* = On and *Let desktop apps access your microphone* = On. The boot log prints the actual registry state (`Windows microphone permissions OK (...)`) so this is verified rather than guessed.
-4. **Force a known-good endpoint**:
+3. **`scratch/level_meter.py`**:
+   Real-time terminal VU meter displaying live per-channel speech-band RMS and peak levels with active 75 Hz high-pass conditioning.
    ```powershell
-   $env:VOICE_CONTROL_DEVICE = "Realtek"   # or the device index, e.g. "12"
-   python -m voice_controller.main
+   python scratch/level_meter.py
    ```
-5. **Capsule / silence forensics**:
-   ```powershell
-   python scratch/diagnose_mic.py --device 12 --speak   # per-channel RMS + inter-channel correlation
-   python scratch/silence_probe.py --device 12          # stream churn, full-duplex, playback mid-stream
-   ```
-6. **Watch the log for the boot summary**: selected device + probe RMS, `Windows microphone permissions OK (...)`,
-   `Microphone capsule scores (speech-band, N blocks): ... | snr=... -> capturing channel X`,
-   `Live capture verified: ...`, then the per-2s `Capture level (2s): ...` lines while you speak.

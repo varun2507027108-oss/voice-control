@@ -224,3 +224,171 @@ def normalize_level(
         gain = min(gain, peak_ceiling / peak)
     gain = max(1.0, float(gain))
     return (x * gain).astype(np.float32), gain
+
+
+def filter_highpass(audio: np.ndarray, samplerate: int = 16000, cutoff_hz: float = 75.0) -> np.ndarray:
+    """Apply a 2nd-order Butterworth high-pass filter to eliminate low-frequency rumble (< 75 Hz)."""
+    if audio is None or len(audio) == 0:
+        return audio
+    x = np.asarray(audio, dtype=np.float32)
+    x = x - float(np.mean(x))
+    if cutoff_hz <= 0 or samplerate <= cutoff_hz * 2 or len(x) < 8:
+        return x
+    try:
+        from scipy.signal import butter, sosfilt
+        sos = butter(2, cutoff_hz, btype="highpass", fs=samplerate, output="sos")
+        return sosfilt(sos, x).astype(np.float32)
+    except Exception:
+        # Simple difference fallback if scipy fails
+        diff = np.diff(x, prepend=x[0])
+        return diff.astype(np.float32)
+
+
+class ChannelPreprocessor:
+    """Preprocesses a single channel stream: removes DC bias, applies 75Hz high-pass filter, and resamples to 16kHz."""
+
+    def __init__(
+        self,
+        native_samplerate: int = 48000,
+        target_samplerate: int = 16000,
+        highpass_hz: float = 75.0,
+    ):
+        self.native_samplerate = native_samplerate
+        self.target_samplerate = target_samplerate
+        self.highpass_hz = highpass_hz
+
+        self.sos = None
+        self.zi = None
+        if highpass_hz > 0 and native_samplerate > highpass_hz * 2:
+            try:
+                from scipy.signal import butter, sosfilt_zi
+                self.sos = butter(2, highpass_hz, btype="highpass", fs=native_samplerate, output="sos")
+                self.zi = sosfilt_zi(self.sos)
+            except Exception as err:
+                logger.warning("Failed to initialize butter highpass filter: %s", err)
+                self.sos = None
+
+        if native_samplerate != target_samplerate:
+            import math
+            g = math.gcd(target_samplerate, native_samplerate)
+            self.up = target_samplerate // g
+            self.down = native_samplerate // g
+        else:
+            self.up = 1
+            self.down = 1
+
+    def process(self, chunk: np.ndarray) -> np.ndarray:
+        """Process 1D raw chunk: remove DC, apply highpass, resample to target_samplerate."""
+        if chunk is None or len(chunk) == 0:
+            return np.zeros(0, dtype=np.float32)
+        x = np.asarray(chunk, dtype=np.float32)
+        # DC removal
+        x = x - float(np.mean(x))
+        # Highpass filtering (attenuates 20-40 Hz rumble)
+        if self.sos is not None:
+            try:
+                from scipy.signal import sosfilt
+                if self.zi is not None:
+                    x, self.zi = sosfilt(self.sos, x, zi=self.zi)
+                else:
+                    x = sosfilt(self.sos, x)
+            except Exception:
+                pass
+        # Resample to target samplerate
+        if self.native_samplerate != self.target_samplerate:
+            try:
+                from scipy.signal import resample_poly
+                x = resample_poly(x, self.up, self.down).astype(np.float32)
+            except Exception:
+                pass
+        return x
+
+    process_chunk = process
+
+
+def measure_channel_profile(audio_1d: np.ndarray, samplerate: int = 16000) -> Dict[str, float]:
+    """Calculate broadband RMS, low-frequency rumble RMS (<100Hz), and speech-band RMS (100Hz - 4kHz)."""
+    if audio_1d is None or len(audio_1d) == 0:
+        return {"broadband_rms": 0.0, "speech_band_rms": 0.0, "low_band_rms": 0.0, "snr_db": 0.0}
+    x = np.asarray(audio_1d, dtype=np.float32)
+    x = x - float(np.mean(x))
+    broadband_rms = float(np.sqrt(np.mean(np.square(x))))
+    if broadband_rms < 1e-6:
+        return {"broadband_rms": 0.0, "speech_band_rms": 0.0, "low_band_rms": 0.0, "snr_db": 0.0}
+
+    fft = np.fft.rfft(x)
+    freqs = np.fft.rfftfreq(len(x), d=1.0 / samplerate)
+
+    low_mask = freqs < 100.0
+    speech_mask = (freqs >= 100.0) & (freqs <= 4000.0)
+
+    low_energy = np.sum(np.abs(fft[low_mask]) ** 2) / (len(x) ** 2)
+    speech_energy = np.sum(np.abs(fft[speech_mask]) ** 2) / (len(x) ** 2)
+
+    low_rms = float(np.sqrt(max(0.0, low_energy)))
+    speech_rms = float(np.sqrt(max(0.0, speech_energy)))
+
+    snr_db = 20.0 * np.log10(max(1e-5, speech_rms) / max(1e-5, low_rms)) if low_rms > 1e-6 else 20.0
+    return {
+        "broadband_rms": round(broadband_rms, 5),
+        "speech_band_rms": round(speech_rms, 5),
+        "low_band_rms": round(low_rms, 5),
+        "snr_db": round(float(snr_db), 1),
+    }
+
+
+class DualChannelSpeechSelector:
+    """Evaluates multi-channel microphone audio for speech activity and locks channel per utterance.
+
+    Eliminates the Realtek array rumble failure where Channel 1 has 21-29 Hz energy that tricks
+    broadband energy detectors. Both channels are filtered and independently evaluated.
+    Once speech is confirmed on a channel, that channel is locked for the duration of the utterance.
+    """
+
+    def __init__(
+        self,
+        native_samplerate: int = 48000,
+        target_samplerate: int = 16000,
+        highpass_hz: float = 75.0,
+        preferred_channel: int = 0,
+    ):
+        self.native_samplerate = native_samplerate
+        self.target_samplerate = target_samplerate
+        self.preprocessors = [
+            ChannelPreprocessor(native_samplerate, target_samplerate, highpass_hz),
+            ChannelPreprocessor(native_samplerate, target_samplerate, highpass_hz),
+        ]
+        self.locked_channel: Optional[int] = None
+        self.selected_channel: int = preferred_channel
+        self.preferred_channel: int = preferred_channel
+        self.channel_profiles: Dict[int, Dict[str, float]] = {}
+
+    def lock_channel(self, channel: int):
+        """Lock active channel for the current utterance to eliminate mid-speech flapping."""
+        self.locked_channel = channel
+        self.selected_channel = channel
+
+    def unlock(self):
+        """Unlock channel when utterance finalizes back to IDLE."""
+        self.locked_channel = None
+
+    def process_block(self, block: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray], int]:
+        """Preprocesses multi-channel audio block.
+
+        Returns:
+            (ch0_16k, ch1_16k_or_None, active_channel_index)
+        """
+        if block is None or len(block) == 0:
+            return np.zeros(0, dtype=np.float32), None, 0
+        if block.ndim == 1 or block.shape[1] == 1:
+            ch0 = block[:, 0] if block.ndim > 1 else block
+            ch0_proc = self.preprocessors[0].process(ch0)
+            return ch0_proc, None, 0
+
+        ch0 = block[:, 0]
+        ch1 = block[:, 1]
+        ch0_proc = self.preprocessors[0].process(ch0)
+        ch1_proc = self.preprocessors[1].process(ch1)
+
+        active_idx = self.locked_channel if self.locked_channel is not None else self.selected_channel
+        return ch0_proc, ch1_proc, active_idx

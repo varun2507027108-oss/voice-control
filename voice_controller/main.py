@@ -39,10 +39,18 @@ from voice_controller.config import (
     CHANNEL_HYSTERESIS,
     DEVICE_PROBE_SECONDS,
     DEVICE_PROBE_MIN_RMS,
+    PRE_VAD_HIGHPASS_HZ,
+    RAW_QUEUE_MAXSIZE,
+    HUD_UPDATE_INTERVAL_S,
     vad_tracker,
 )
 import voice_controller.actions as actions
-from voice_controller.audio_utils import ChannelScorer, channel_scores, rank_input_candidates, select_channel
+from voice_controller.audio_utils import (
+    DualChannelSpeechSelector,
+    measure_channel_profile,
+    rank_input_candidates,
+    select_channel,
+)
 from voice_controller.engine_stt import get_stt_engine, is_plausible_speech
 from voice_controller.engine_intent import get_intent_router
 from voice_controller.overlay import HUDOverlay
@@ -108,29 +116,33 @@ class VoiceControllerPipeline:
         self.intent_router = None
         self.stream: Optional[sd.InputStream] = None
 
+        # Raw audio ring queue between PortAudio callback and audio worker thread
+        self.raw_audio_queue: queue.Queue = queue.Queue(maxsize=RAW_QUEUE_MAXSIZE)
+        self.audio_worker_thread: Optional[threading.Thread] = None
+        self._raw_queue_drops = 0
+        self._last_hud_update = 0.0
+
+        # Dual-channel speech selector & preprocessor (DC removal + 75Hz highpass + 16kHz resample)
+        self.channel_selector = DualChannelSpeechSelector(
+            native_samplerate=self.native_samplerate,
+            target_samplerate=SAMPLE_RATE,
+            highpass_hz=PRE_VAD_HIGHPASS_HZ,
+        )
+
         # Audio Stream Health & Watchdog
         self._callback_count = 0
         self._last_callback_time = 0.0
         self._callback_errors = 0
         self._watchdog_thread: Optional[threading.Thread] = None
         self._last_restart_time = 0.0
-        # Latched microphone-array channel (0 until the louder capsule is measured)
+        # Preferred/locked channel
         self._preferred_channel = 0
-        # SNR-based capsule scorer: stable under the near-equal band energies measured on this
-        # Realtek array, where a raw per-block comparison flapped between ch0 and ch1.
-        self._channel_scorer = ChannelScorer()
 
-        # Live capture-level telemetry: proves whether audio is reaching the app at all.
-        # This separates "the microphone delivers silence" (Windows/privacy/driver) from
-        # "the microphone delivers audio but the VAD disagrees" — very different fixes.
+        # Live capture-level telemetry
         self._level_window: List[float] = []
         self._peak_window = 0.0
         self._max_rms_seen = 0.0
         self._last_level_log = time.perf_counter()
-
-        # Microphone-array capsule score evidence (logged once per session)
-        self._channel_score_accum: List[np.ndarray] = []
-        self._channel_scores_logged = False
 
         # Digital-silence recovery state
         self._silent_since: Optional[float] = None
@@ -145,9 +157,6 @@ class VoiceControllerPipeline:
         self.device_index = cand["index"]
         dev_info = cand["info"]
         self.device_name = dev_info.get("name", "default")
-        # Support native channel count (e.g. channels=2 for Realtek stereo array on WASAPI).
-        # Downmixing to mono is safely performed in _audio_callback via select_channel(),
-        # which latches onto the loudest capsule instead of averaging channels.
         self.input_channels = min(2, max(1, int(dev_info.get("max_input_channels", 1))))
         vad_tracker.set_device_name(self.device_name)
 
@@ -163,6 +172,13 @@ class VoiceControllerPipeline:
             self.resample_up = 1
             self.resample_down = 1
             self.native_chunk_size = CHUNK_SIZE
+
+        # Re-initialize preprocessor for active sample rate
+        self.channel_selector = DualChannelSpeechSelector(
+            native_samplerate=self.native_samplerate,
+            target_samplerate=SAMPLE_RATE,
+            highpass_hz=PRE_VAD_HIGHPASS_HZ,
+        )
 
     def _detect_input_device(self):
         """Identify the best working input device.
@@ -223,11 +239,13 @@ class VoiceControllerPipeline:
                 )
             else:
                 dev_info = sd.query_devices(kind="input")
-                self._apply_device({"index": None, "name": dev_info.get("name", "default"), "api": "Default", "info": dev_info})
+                self._apply_device({"index": None, "name": dev_info.get("name", "NO MICROPHONE"), "api": "Default", "info": dev_info})
                 self.candidate_devices.append({"index": None, "name": self.device_name, "api": "Default", "info": dev_info})
-                logger.warning("No candidate passed the liveness probe, falling back to default device '%s'", self.device_name)
+                logger.critical("NO MICROPHONE: No candidate input device passed the liveness probe (all silent or inaccessible).")
+                self.hud.update_state(status="IGNORED", feedback="NO MICROPHONE DETECTED")
         except Exception as err:
-            logger.warning("Could not query input audio device: %s", err)
+            logger.critical("Could not query input audio device (NO MICROPHONE): %s", err)
+            self.hud.update_state(status="IGNORED", feedback="NO MICROPHONE DETECTED")
             self.device_index = None
             self.input_channels = CHANNELS
             self.native_samplerate = SAMPLE_RATE
@@ -488,8 +506,11 @@ class VoiceControllerPipeline:
             logger.info("Windows microphone endpoint OK (level %.0f%%, muted=%s).", level_pct, mic_status.get("muted"))
 
     def _flush_speech_buffer(self):
-        """Package buffered speech audio and dispatch to STT worker queue."""
-        # Drain any pending live transcription snapshots
+        """Package buffered speech audio, unlock channel, and dispatch to STT worker queue."""
+        # Unlock channel so next utterance can independently re-evaluate channels
+        self.channel_selector.unlock()
+
+        # Drain any pending live transcription snapshots so final STT is not delayed
         while not self.live_task_queue.empty():
             try:
                 self.live_task_queue.get_nowait()
@@ -529,11 +550,9 @@ class VoiceControllerPipeline:
         self.hud.update_state(audio_level=0.0)
 
     def _audio_callback(self, indata, frames, time_info, status):
-        """PortAudio callback with hard exception containment.
+        """PortAudio callback: copy-only into bounded raw queue.
 
-        An exception raised inside a PortAudio callback aborts the stream, which shows
-        up to the user as "the app stopped hearing me". All processing therefore runs
-        inside try/except and failures are counted and surfaced instead of silent.
+        Zero Torch inference, zero resampling, zero heavy math, zero GUI calls.
         """
         if status:
             logger.debug("SoundDevice status warning: %s", status)
@@ -546,140 +565,138 @@ class VoiceControllerPipeline:
         self._last_callback_time = time.perf_counter()
 
         try:
-            self._handle_audio_block(indata)
+            if self.raw_audio_queue.full():
+                try:
+                    _ = self.raw_audio_queue.get_nowait()
+                    self._raw_queue_drops += 1
+                except queue.Empty:
+                    pass
+            self.raw_audio_queue.put_nowait(indata.copy())
         except Exception as err:
             self._callback_errors += 1
             if self._callback_errors <= 3 or self._callback_errors % 100 == 0:
                 logger.error(
-                    "Audio callback error #%d: %s", self._callback_errors, err, exc_info=True
+                    "Audio callback enqueue error #%d: %s", self._callback_errors, err
                 )
-            if self._callback_errors == 1:
-                self.hud.update_state(status="IGNORED", feedback="Audio processing error (see log)")
 
-    def _handle_audio_block(self, indata):
-        """Downmix, resample, and drive the VAD state machine for a single capture block."""
-        # Prefer the loudest microphone-array capsule. Blind np.mean(axis=1) downmix
-        # discards ~6 dB when one capsule is attenuated, and cancels the voice
-        # entirely when capsules are phase-inverted (both observed on Realtek arrays).
-        if indata.ndim > 1 and indata.shape[1] > 1:
-            # Score capsules by how far they rise above their own tracked hiss floor, then latch
-            # onto the best one. Passing the score array in keeps the decision stable (no flapping).
-            capsule_scores = self._channel_scorer.update(indata, self.native_samplerate)
-            raw_chunk, preferred = select_channel(
-                indata,
-                self._preferred_channel,
-                CHANNEL_HYSTERESIS,
-                samplerate=self.native_samplerate,
-                scores=capsule_scores,
-            )
-            # First-second evidence trail: which capsule is actually carrying voice-band
-            # energy. Without this, a mis-latched capsule is impossible to spot in a log.
-            if not self._channel_scores_logged:
-                self._channel_score_accum.append(channel_scores(indata, self.native_samplerate))
-                if len(self._channel_score_accum) >= 20:
-                    mean_scores = np.mean(np.asarray(self._channel_score_accum), axis=0)
-                    logger.info(
-                        "Microphone capsule scores (speech-band, %d blocks): %s | snr=%s -> capturing channel %d of '%s'.",
-                        len(self._channel_score_accum),
-                        ", ".join(f"ch{i}={s:.4f}" for i, s in enumerate(mean_scores)),
-                        ", ".join(f"ch{i}={s:.2f}" for i, s in enumerate(np.atleast_1d(capsule_scores))),
-                        preferred,
-                        self.device_name,
-                    )
-                    self._channel_score_accum = []
-                    self._channel_scores_logged = True
-            if preferred != self._preferred_channel:
-                logger.info(
-                    "Microphone channel switch: capturing input channel %d of '%s'.",
-                    preferred,
-                    self.device_name,
-                )
-                self._preferred_channel = preferred
-        elif indata.ndim > 1:
-            raw_chunk = indata[:, 0].copy()
-        else:
-            raw_chunk = indata.flatten().copy()
+    def _audio_worker_loop(self):
+        """Dedicated audio processing worker running outside PortAudio callback:
+        - Dequeues raw float32 audio blocks from raw_audio_queue
+        - DC removal + 75Hz high-pass filtering + 16kHz resampling via channel_selector
+        - Dual-channel Silero neural VAD evaluation
+        - Utterance-level channel locking
+        - Feeds pre-roll and speech buffers
+        - Coalesced visual meter updates to HUD
+        """
+        logger.info("Audio processing worker thread started.")
+        while self.is_running and not self.shutdown_event.is_set():
+            try:
+                raw_indata = self.raw_audio_queue.get(timeout=0.15)
+            except queue.Empty:
+                continue
 
-        # Demean raw chunk immediately to strip hardware DC offset
-        raw_chunk = raw_chunk - float(np.mean(raw_chunk))
+            try:
+                self._handle_audio_block(raw_indata)
+            except Exception as err:
+                logger.error("Audio worker processing error: %s", err, exc_info=True)
+            finally:
+                self.raw_audio_queue.task_done()
 
-        # Resample to 16kHz if captured at native sample rate (resampler pre-imported)
-        if self.native_samplerate != SAMPLE_RATE and resample_poly is not None:
-            chunk = resample_poly(raw_chunk, self.resample_up, self.resample_down).astype(np.float32)
-            if len(chunk) > CHUNK_SIZE:
-                chunk = chunk[:CHUNK_SIZE]
-            elif len(chunk) < CHUNK_SIZE:
-                chunk = np.pad(chunk, (0, CHUNK_SIZE - len(chunk)))
-        else:
-            chunk = raw_chunk
+    def _handle_audio_block(self, indata: np.ndarray):
+        """Preprocess audio, run dual-channel Silero VAD, and manage utterance state machine."""
+        ch0_16k, ch1_16k, active_idx = self.channel_selector.process_block(indata)
 
-        # Collect calibration chunks if in active in-stream calibration procedure
+        # In-stream calibration recording
         if getattr(self, "_calibrating", False):
-            self._calib_samples.append(chunk)
+            self._calib_samples.append((ch0_16k, ch1_16k))
 
-        is_speech_chunk = self.vad.is_speech(chunk, is_speaking=self.is_speaking)
-        rms = vad_tracker.compute_rms(chunk)
+        # Evaluate dual-channel Silero neural VAD
+        is_speech_chunk, best_ch, p0, p1 = self.vad.evaluate_dual(
+            ch0_16k,
+            ch1_16k,
+            is_speaking=self.is_speaking,
+            locked_channel=self.channel_selector.locked_channel,
+            hud=None,
+        )
+
+        active_chunk = ch0_16k if best_ch == 0 or ch1_16k is None else ch1_16k
+        rms = vad_tracker.compute_rms(active_chunk)
+
         # Track digital silence (rms==0) so the watchdog can heal a dead-but-"active" stream
         if rms < 1e-5:
             if self._silent_since is None:
                 self._silent_since = time.perf_counter()
         else:
             self._silent_since = None
+
         if not self.is_speaking and not is_speech_chunk:
             vad_tracker.adapt_floor(rms)
 
-        # Real-time visual pulse level (scaled relative to current noise floor and onset threshold)
-        onset_th, _ = vad_tracker.get_thresholds()
-        dynamic_scale = max(0.015, (onset_th - vad_tracker.noise_floor) * 2.5)
-        norm_level = min(1.0, max(0.0, (rms - vad_tracker.noise_floor) / dynamic_scale))
-        self.hud.update_state(audio_level=norm_level)
+        now_time = time.perf_counter()
 
-        # Capture-level telemetry: the only evidence that distinguishes an endpoint which
-        # delivers silence from a VAD that simply disagrees about what it hears.
+        # Coalesced visual pulse level updates to HUD (throttled)
+        if (now_time - self._last_hud_update) >= HUD_UPDATE_INTERVAL_S:
+            self._last_hud_update = now_time
+            onset_th, _ = vad_tracker.get_thresholds()
+            dynamic_scale = max(0.015, (onset_th - vad_tracker.noise_floor) * 2.5)
+            norm_level = min(1.0, max(0.0, (rms - vad_tracker.noise_floor) / dynamic_scale))
+            self.hud.update_state(audio_level=norm_level)
+
+        # Capture-level telemetry: distinguishes dead mic from VAD disagreement
         self._level_window.append(rms)
-        self._peak_window = max(self._peak_window, float(np.max(np.abs(chunk))) if len(chunk) else 0.0)
+        self._peak_window = max(self._peak_window, float(np.max(np.abs(active_chunk))) if len(active_chunk) else 0.0)
         self._max_rms_seen = max(self._max_rms_seen, rms)
-        now_level = time.perf_counter()
-        if now_level - self._last_level_log >= 2.0 and self._level_window:
+        if (now_time - self._last_level_log) >= 2.0 and self._level_window:
             window = np.asarray(self._level_window, dtype=np.float32)
+            onset_th, _ = vad_tracker.get_thresholds()
             logger.info(
-                "Capture level (%.1fs): rms p50=%.4f p95=%.4f max=%.4f peak=%.3f | floor=%.4f onset=%.4f | ch=%d",
-                now_level - self._last_level_log,
+                "Capture level (%.1fs): rms p50=%.4f p95=%.4f max=%.4f peak=%.3f | floor=%.4f onset=%.4f | ch=%d (p0=%.2f, p1=%.2f, drops=%d)",
+                now_time - self._last_level_log,
                 float(np.percentile(window, 50)),
                 float(np.percentile(window, 95)),
                 float(np.max(window)),
                 self._peak_window,
                 vad_tracker.noise_floor,
                 onset_th,
-                self._preferred_channel,
+                best_ch,
+                p0,
+                p1,
+                self._raw_queue_drops,
             )
             self._level_window = []
             self._peak_window = 0.0
-            self._last_level_log = now_level
+            self._last_level_log = now_time
 
         # Continually store pre-roll chunks
-        self.preroll_buffer.append(chunk)
+        self.preroll_buffer.append(active_chunk)
 
         if is_speech_chunk:
             if not self.is_speaking:
                 self.is_speaking = True
+                # Lock channel for the entire utterance!
+                self.channel_selector.lock_channel(best_ch)
                 self.speech_start_time = time.perf_counter()
                 self._last_live_transcribe_time = self.speech_start_time
                 self._last_partial_text = ""
                 # Prepend the pre-roll buffer so initial consonants/syllables are never clipped
                 self.speech_buffer = list(self.preroll_buffer)
                 self.silence_samples = 0
-                logger.debug("Speech onset detected (RMS=%.4f, floor=%.4f)", rms, vad_tracker.noise_floor)
+                logger.info(
+                    "Speech onset detected on CH%d (prob=%.2f, RMS=%.4f, floor=%.4f). Locked channel.",
+                    best_ch,
+                    p0 if best_ch == 0 else p1,
+                    rms,
+                    vad_tracker.noise_floor,
+                )
                 self.hud.update_state(
                     status="HEARING",
                     live_transcription="...",
                 )
 
-            self.speech_buffer.append(chunk)
+            self.speech_buffer.append(active_chunk)
             self.silence_samples = 0
 
             # Continuous live transcription: feed live audio snapshot to background partial transcriber
-            now_time = time.perf_counter()
             if (
                 self.stt_engine is not None
                 and len(self.speech_buffer) >= 6
@@ -704,8 +721,8 @@ class VoiceControllerPipeline:
 
         elif self.is_speaking:
             # Silence detected after speech was initiated
-            self.speech_buffer.append(chunk)
-            self.silence_samples += len(chunk)
+            self.speech_buffer.append(active_chunk)
+            self.silence_samples += len(active_chunk)
 
             silence_secs = self.silence_samples / float(SAMPLE_RATE)
             if silence_secs >= SILENCE_DURATION:
@@ -726,22 +743,51 @@ class VoiceControllerPipeline:
             self._calibrating = False
 
             if self._calib_samples:
-                rms_vals = [vad_tracker.compute_rms(c) for c in self._calib_samples if len(c) > 0]
-                if rms_vals:
-                    measured_floor = float(np.percentile(rms_vals, 20))
-                    vad_tracker.save_calibrated_floor(measured_floor, device_name=self.device_name)
+                ch0_parts = [s[0] for s in self._calib_samples if s[0] is not None and len(s[0]) > 0]
+                if ch0_parts:
+                    ch0_all = np.concatenate(ch0_parts)
+                    p0 = measure_channel_profile(ch0_all, SAMPLE_RATE)
+                    channel_profiles = {"0": p0}
+                    preferred = 0
+
+                    if self._calib_samples[0][1] is not None:
+                        ch1_parts = [s[1] for s in self._calib_samples if s[1] is not None and len(s[1]) > 0]
+                        if ch1_parts:
+                            ch1_all = np.concatenate(ch1_parts)
+                            p1 = measure_channel_profile(ch1_all, SAMPLE_RATE)
+                            channel_profiles["1"] = p1
+                            # Prefer cleaner channel
+                            if p0["low_band_rms"] < p1["low_band_rms"] * 0.8:
+                                preferred = 0
+                            elif p1["low_band_rms"] < p0["low_band_rms"] * 0.8:
+                                preferred = 1
+
+                    measured_floor = p0["speech_band_rms"] if preferred == 0 else channel_profiles.get("1", p0)["speech_band_rms"]
+                    measured_floor = max(0.003, float(measured_floor))
+                    vad_tracker.save_calibrated_floor(
+                        measured_floor,
+                        device_name=self.device_name,
+                        channel_profiles=channel_profiles,
+                        preferred_channel=preferred,
+                    )
                     onset_th, _ = vad_tracker.get_thresholds()
                     logger.info(
-                        "Microphone '%s' calibrated floor: %.4f (onset threshold: %.4f)",
+                        "Microphone '%s' calibrated floor: %.4f (preferred ch%d, onset threshold: %.4f)",
                         self.device_name,
                         measured_floor,
+                        preferred,
                         onset_th,
                     )
                     self.hud.update_state(
                         status="EXECUTED",
-                        feedback=f"Calibrated noise floor to {measured_floor:.4f}",
+                        feedback=f"Calibrated noise floor: {measured_floor:.4f} (ch{preferred})",
                     )
                     return
+            self.hud.update_state(status="IGNORED", feedback="Calibration failed: no audio captured")
+        except Exception as err:
+            self._calibrating = False
+            logger.error("Calibration failed: %s", err)
+            self.hud.update_state(status="IGNORED", feedback=f"Calibration error: {err}")
             self.hud.update_state(status="IGNORED", feedback="Calibration failed: no audio captured")
         except Exception as err:
             self._calibrating = False
@@ -821,12 +867,16 @@ class VoiceControllerPipeline:
             audio_np, noise_floor=vad_tracker.noise_floor
         )
 
-        if not stt_result.trusted:
-            last_rms = float(getattr(self.stt_engine, "last_input_rms", 0.0))
-            last_gain = float(getattr(self.stt_engine, "last_gain", 1.0))
+        last_rms = float(getattr(self.stt_engine, "last_input_rms", 0.0))
+        last_gain = float(getattr(self.stt_engine, "last_gain", 1.0))
+
+        if not stt_result.safe_for_execution or not stt_result.trusted:
             logger.warning(
-                "[STTEngine] Untrusted transcript rejected: text='%s' no_speech_prob=%.4f avg_logprob=%.4f compression_ratio=%.4f input_rms=%.4f gain=%.1fx",
+                "[STTEngine] Untrusted/unsafe transcript rejected: text='%s' speech_detected=%s quality=%.2f safe=%s no_speech_prob=%.4f avg_logprob=%.4f compression_ratio=%.4f input_rms=%.4f gain=%.1fx",
                 stt_result.text,
+                stt_result.speech_detected,
+                stt_result.quality_score,
+                stt_result.safe_for_execution,
                 stt_result.no_speech_prob,
                 stt_result.avg_logprob,
                 stt_result.compression_ratio,
@@ -835,14 +885,15 @@ class VoiceControllerPipeline:
             )
             self._save_rejected_wav(
                 audio_np,
-                reason=f"untrusted_speech_prob_{stt_result.no_speech_prob:.2f}_logprob_{stt_result.avg_logprob:.2f}_rms_{last_rms:.4f}",
+                reason=f"untrusted_speech_{stt_result.speech_detected}_quality_{stt_result.quality_score:.2f}_rms_{last_rms:.4f}",
             )
-            # Separate "you spoke too softly" from "that was not a command" so the
-            # on-screen hint actually tells the user what to change.
-            if last_rms and last_rms < 0.01 and last_gain >= 2.0:
+            if not stt_result.speech_detected or (last_rms and last_rms < 0.01 and last_gain >= 2.0):
                 feedback = "Too quiet — speak closer to the mic"
+            elif stt_result.text and not stt_result.safe_for_execution:
+                feedback = f"Low audio quality ({stt_result.quality_score:.1f}) — speak clearer"
             else:
                 feedback = "Didn't catch that"
+
             self.hud.update_state(
                 status="IGNORED",
                 transcription=stt_result.text or "",
@@ -1127,11 +1178,15 @@ class VoiceControllerPipeline:
         )
 
     def start(self):
-        """Start audio stream, inference worker, and stream watchdog."""
+        """Start audio worker, inference workers, stream watchdog, and input stream."""
         self.is_running = True
         self.shutdown_event.clear()
 
-        # Launch worker thread
+        # Launch dedicated audio processing worker (VAD, high-pass filtering, channel selection)
+        self.audio_worker_thread = threading.Thread(target=self._audio_worker_loop, daemon=True, name="AudioWorkerThread")
+        self.audio_worker_thread.start()
+
+        # Launch final inference worker thread
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True, name="WorkerThread")
         self.worker_thread.start()
 
@@ -1148,15 +1203,29 @@ class VoiceControllerPipeline:
         self._verify_live_capture()
 
     def stop(self):
-        """Gracefully stop audio stream and release GPU memory."""
+        """Gracefully stop audio stream and release resources."""
         logger.info("Stopping VoiceControllerPipeline...")
         self.is_running = False
         self.shutdown_event.set()
+
+        # Drain raw audio queue
+        while not self.raw_audio_queue.empty():
+            try:
+                self.raw_audio_queue.get_nowait()
+            except queue.Empty:
+                break
 
         # Drain live task queue
         while not self.live_task_queue.empty():
             try:
                 self.live_task_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        # Drain audio task queue
+        while not self.audio_task_queue.empty():
+            try:
+                self.audio_task_queue.get_nowait()
             except queue.Empty:
                 break
 

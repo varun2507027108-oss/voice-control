@@ -39,20 +39,27 @@ STT_NO_SPEECH_MAX: float = 0.60     # Reject transcripts above this no-speech pr
 STT_AVG_LOGPROB_MIN: float = -1.00  # Relaxed from -0.8: soft/quiet speech was being rejected here
 STT_COMPRESSION_MAX: float = 2.40   # Reject repetitive/hallucinated transcripts
 
+# Pre-VAD audio filtering and buffering constants
+PRE_VAD_HIGHPASS_HZ: float = 75.0   # Suppress ~21-29 Hz chassis/fan rumble on Realtek array
+PRE_VAD_LOWPASS_HZ: float = 7500.0  # Upper limit of useful speech band
+RAW_QUEUE_MAXSIZE: int = 25         # Bounded PortAudio capture queue (drop oldest on full)
+PRE_VAD_TARGET_RMS: float = 0.035   # Conservative pre-VAD conditioning level for quiet mic
+PRE_VAD_MAX_GAIN: float = 3.5       # Strict gain cap pre-VAD so noise/rumble is not amplified
+HUD_UPDATE_INTERVAL_S: float = 0.05 # Coalesced HUD meter update cadence (~20 Hz)
+
 # Boot-time microphone-level auto-fix (percent).
-# Automatically raises microphone input level to 100% on boot if below 80% to ensure speech recognition works reliably.
+# Defaults to False (opt-in). Only modifies Windows input level if explicitly enabled via env.
 AUTO_FIX_MIC_ENV: str = "VOICE_CONTROL_AUTO_FIX_MIC"
-AUTO_FIX_MIC_LEVEL: bool = os.environ.get(AUTO_FIX_MIC_ENV, "1").strip().lower() not in ("0", "false", "no")
+AUTO_FIX_MIC_LEVEL: bool = os.environ.get(AUTO_FIX_MIC_ENV, "0").strip().lower() in ("1", "true", "yes")
 MIC_LEVEL_TARGET_PCT: float = 100.0
 MIC_LEVEL_ENV: str = "VOICE_CONTROL_MIC_LEVEL"
-MIC_LEVEL_LOW_PCT: float = 80.0  # Below this the boot check auto-raises or warns
+MIC_LEVEL_LOW_PCT: float = 80.0  # Below this the boot check warns
 
 # Microphone calibration persistence
 CALIBRATION_FILE_PATH: Path = Path.home() / ".voice_control_mic.json"
 
-
 # Calibration schema version — bump whenever the RMS or VAD math changes
-CALIB_SCHEMA: str = "ac-coupled-v1"
+CALIB_SCHEMA: str = "per-channel-v2"
 
 
 class AdaptiveVAD:
@@ -79,6 +86,8 @@ class AdaptiveVAD:
 
     def _load_calibrated_floor(self):
         """Load persisted calibrated noise floor for current device name with schema validation."""
+        self.channel_profiles: Dict[str, Any] = {}
+        self.preferred_channel: Optional[int] = None
         if CALIBRATION_FILE_PATH.exists():
             try:
                 with open(CALIBRATION_FILE_PATH, "r", encoding="utf-8") as f:
@@ -87,21 +96,36 @@ class AdaptiveVAD:
                     # Check device-specific record first
                     dev_data = data.get(self.device_name)
                     if isinstance(dev_data, dict):
-                        # Schema check: reject stale calibration from older RMS math
-                        if dev_data.get("schema") != CALIB_SCHEMA:
+                        # Schema check: accept current or compatible schemas
+                        schema = dev_data.get("schema")
+                        if schema not in (CALIB_SCHEMA, "ac-coupled-v1"):
                             return
                         saved_floor = dev_data.get("noise_floor")
                         if saved_floor and isinstance(saved_floor, (int, float)):
                             self.noise_floor = float(saved_floor)
                         if "k" in dev_data and isinstance(dev_data["k"], (int, float)):
                             self.k = float(dev_data["k"])
+                        if "preferred_channel" in dev_data:
+                            self.preferred_channel = int(dev_data["preferred_channel"])
+                        if "channels" in dev_data and isinstance(dev_data["channels"], dict):
+                            self.channel_profiles = dev_data["channels"]
             except Exception:
                 pass
 
-    def save_calibrated_floor(self, floor_val: float, device_name: Optional[str] = None):
+    def save_calibrated_floor(
+        self,
+        floor_val: float,
+        device_name: Optional[str] = None,
+        channels_info: Optional[Dict[str, Any]] = None,
+        preferred_channel: Optional[int] = None,
+    ):
         """Persist measured noise floor keyed by device name to local user config."""
         dev = (device_name or self.device_name).strip()
         self.noise_floor = max(self.floor_min, min(self.floor_max, float(floor_val)))
+        if preferred_channel is not None:
+            self.preferred_channel = preferred_channel
+        if channels_info is not None:
+            self.channel_profiles = channels_info
 
         data: Dict[str, Any] = {}
         if CALIBRATION_FILE_PATH.exists():
@@ -113,11 +137,17 @@ class AdaptiveVAD:
             except Exception:
                 data = {}
 
-        data[dev] = {
+        record: Dict[str, Any] = {
             "schema": CALIB_SCHEMA,
             "noise_floor": round(self.noise_floor, 4),
             "k": round(self.k, 2),
         }
+        if self.preferred_channel is not None:
+            record["preferred_channel"] = self.preferred_channel
+        if self.channel_profiles:
+            record["channels"] = self.channel_profiles
+
+        data[dev] = record
 
         try:
             with open(CALIBRATION_FILE_PATH, "w", encoding="utf-8") as f:

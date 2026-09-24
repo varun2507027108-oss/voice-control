@@ -291,22 +291,42 @@ def action_open_editor() -> ActionResult:
     return ActionResult(False, "Could not locate code editor", {})
 
 
+SAFE_APP_WHITELIST: Dict[str, str] = {
+    "chrome": "chrome",
+    "google chrome": "chrome",
+    "edge": "msedge",
+    "microsoft edge": "msedge",
+    "msedge": "msedge",
+    "browser": "chrome",
+    "terminal": "wt",
+    "windows terminal": "wt",
+    "powershell": "powershell.exe",
+    "cmd": "cmd.exe",
+    "command prompt": "cmd.exe",
+    "vscode": "code",
+    "code": "code",
+    "vs code": "code",
+    "notepad": "notepad.exe",
+    "calculator": "calc.exe",
+    "calc": "calc.exe",
+    "explorer": "explorer.exe",
+    "file explorer": "explorer.exe",
+    "files": "explorer.exe",
+    "spotify": "spotify.exe",
+    "task manager": "taskmgr.exe",
+    "settings": "ms-settings:",
+}
+
+
 def action_open_generic_app(app_name: str) -> ActionResult:
-    """Attempt to launch an application by name."""
+    """Attempt to launch an application by name restricted to a secure allowlist."""
     clean_name = app_name.strip().lower()
 
-    # Map common aliases
-    alias_map = {
-        "calculator": "calc.exe",
-        "calc": "calc.exe",
-        "spotify": "spotify.exe",
-        "task manager": "taskmgr.exe",
-        "settings": "ms-settings:",
-        "file explorer": "explorer.exe",
-        "explorer": "explorer.exe",
-    }
+    if clean_name not in SAFE_APP_WHITELIST:
+        logger.warning("Blocked attempt to launch non-allowlisted application: '%s'", app_name)
+        return ActionResult(False, f"Application '{app_name}' is not in the safe allowlist", {})
 
-    target = alias_map.get(clean_name, clean_name)
+    target = SAFE_APP_WHITELIST[clean_name]
 
     if target.endswith(":"):  # Windows URI protocol scheme
         try:
@@ -319,7 +339,7 @@ def action_open_generic_app(app_name: str) -> ActionResult:
     if exe_path and _spawn_detached(exe_path):
         return ActionResult(True, f"Launched {app_name}", {"app": app_name})
 
-    # Try os.startfile as fallback for installed Windows apps
+    # For installed Store / Windows apps that are strictly verified in the allowlist
     try:
         os.startfile(target)
         return ActionResult(True, f"Launched {app_name}", {"app": app_name})

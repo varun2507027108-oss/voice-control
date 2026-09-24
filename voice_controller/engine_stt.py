@@ -59,6 +59,9 @@ class SttResult(str):
     no_speech_prob: float
     avg_logprob: float
     compression_ratio: float
+    speech_detected: bool = False
+    quality_score: float = 0.0
+    safe_for_execution: bool = False
 
     def __new__(
         cls,
@@ -67,6 +70,9 @@ class SttResult(str):
         no_speech_prob: float,
         avg_logprob: float,
         compression_ratio: float,
+        speech_detected: bool = False,
+        quality_score: float = 0.0,
+        safe_for_execution: Optional[bool] = None,
     ):
         obj = str.__new__(cls, text)
         obj.text = text
@@ -74,13 +80,17 @@ class SttResult(str):
         obj.no_speech_prob = float(no_speech_prob)
         obj.avg_logprob = float(avg_logprob)
         obj.compression_ratio = float(compression_ratio)
+        obj.speech_detected = bool(speech_detected) if speech_detected else (bool(text) and is_plausible_speech(text))
+        obj.quality_score = float(quality_score)
+        obj.safe_for_execution = bool(safe_for_execution if safe_for_execution is not None else trusted)
         return obj
 
     def __repr__(self) -> str:
         return (
             f"SttResult(text='{self.text}', trusted={self.trusted}, "
-            f"no_speech_prob={self.no_speech_prob:.4f}, avg_logprob={self.avg_logprob:.4f}, "
-            f"compression_ratio={self.compression_ratio:.4f})"
+            f"speech_detected={self.speech_detected}, quality={self.quality_score:.2f}, "
+            f"safe={self.safe_for_execution}, no_speech_prob={self.no_speech_prob:.4f}, "
+            f"avg_logprob={self.avg_logprob:.4f}, compression_ratio={self.compression_ratio:.4f})"
         )
 
 
@@ -93,9 +103,11 @@ class WhisperSTTEngine:
         device: str = DEVICE,
         compute_type: Optional[str] = None,
     ):
+        import threading
         self.model_id = model_id
         self.device = device
         self.sr = SAMPLE_RATE
+        self._inference_lock = threading.Lock()
         # Diagnostics for the most recent utterance (used for HUD hinting / logs)
         self.last_input_rms: float = 0.0
         self.last_gain: float = 1.0
@@ -232,38 +244,32 @@ class WhisperSTTEngine:
                 STT_TARGET_RMS,
             )
 
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-
-        try:
-            segments, info = self.model.transcribe(
-                audio_1d,
-                language="en",
-                beam_size=1,
-                best_of=1,
-                temperature=0.0,
-                condition_on_previous_text=False,
-                without_timestamps=True,
-                word_timestamps=False,
-                vad_filter=False,
-                no_speech_threshold=STT_NO_SPEECH_MAX,
-                log_prob_threshold=STT_AVG_LOGPROB_MIN,
-                compression_ratio_threshold=STT_COMPRESSION_MAX,
-            )
-            seg_list = list(segments)
-        except Exception as err:
-            logger.error("Error during faster-whisper transcription: %s", err, exc_info=True)
-            return SttResult(
-                text="",
-                trusted=False,
-                no_speech_prob=1.0,
-                avg_logprob=-99.0,
-                compression_ratio=1.0,
-            )
+        with self._inference_lock:
+            try:
+                segments, info = self.model.transcribe(
+                    audio_1d,
+                    language="en",
+                    beam_size=1,
+                    best_of=1,
+                    temperature=0.0,
+                    condition_on_previous_text=False,
+                    without_timestamps=True,
+                    word_timestamps=False,
+                    vad_filter=False,
+                    no_speech_threshold=STT_NO_SPEECH_MAX,
+                    log_prob_threshold=STT_AVG_LOGPROB_MIN,
+                    compression_ratio_threshold=STT_COMPRESSION_MAX,
+                )
+                seg_list = list(segments)
+            except Exception as err:
+                logger.error("Error during faster-whisper transcription: %s", err, exc_info=True)
+                return SttResult(
+                    text="",
+                    trusted=False,
+                    no_speech_prob=1.0,
+                    avg_logprob=-99.0,
+                    compression_ratio=1.0,
+                )
 
         if not seg_list:
             return SttResult(
@@ -283,18 +289,23 @@ class WhisperSTTEngine:
         avg_logprob = min(s.avg_logprob for s in seg_list)
         compression_ratio = max(s.compression_ratio for s in seg_list)
 
+        # Speech detected check
+        speech_detected = bool(cleaned_text) and is_plausible_speech(cleaned_text)
+
+        # Compute normalized quality score [0.0 - 1.0]
+        no_speech_score = max(0.0, 1.0 - no_speech_prob)
+        logprob_score = float(np.clip((avg_logprob + 2.5) / 2.5, 0.0, 1.0))
+        compression_score = 1.0 if compression_ratio <= 1.8 else max(0.0, 1.0 - (compression_ratio - 1.8))
+        quality_score = float(np.clip(0.4 * logprob_score + 0.4 * no_speech_score + 0.2 * compression_score, 0.0, 1.0))
+
         # Trust formula (thresholds configurable in config.py):
-        # trusted = bool(text) and is_plausible_speech(text) and no_speech_prob < STT_NO_SPEECH_MAX
-        #           and avg_logprob > STT_AVG_LOGPROB_MIN and compression_ratio < STT_COMPRESSION_MAX
-        # avg_logprob was relaxed from -0.8 to -1.0: soft/quiet speech is transcribed
-        # correctly by Whisper but scores below the old gate, causing false "can't hear you" rejections.
         trusted = (
-            bool(cleaned_text)
-            and is_plausible_speech(cleaned_text)
+            speech_detected
             and no_speech_prob < STT_NO_SPEECH_MAX
             and avg_logprob > STT_AVG_LOGPROB_MIN
             and compression_ratio < STT_COMPRESSION_MAX
         )
+        safe_for_execution = trusted and (quality_score >= 0.30)
 
         return SttResult(
             text=cleaned_text,
@@ -302,6 +313,9 @@ class WhisperSTTEngine:
             no_speech_prob=no_speech_prob,
             avg_logprob=avg_logprob,
             compression_ratio=compression_ratio,
+            speech_detected=speech_detected,
+            quality_score=quality_score,
+            safe_for_execution=safe_for_execution,
         )
 
     def transcribe_partial(self, audio_np: np.ndarray) -> str:
@@ -320,6 +334,12 @@ class WhisperSTTEngine:
 
         audio_1d, _ = normalize_level(audio_1d, target_rms=STT_TARGET_RMS, max_gain=STT_MAX_GAIN)
 
+        # Non-blocking lock attempt: If final STT inference is currently running,
+        # immediately yield without contending or delaying final command processing.
+        acquired = self._inference_lock.acquire(blocking=False)
+        if not acquired:
+            return ""
+
         try:
             segments, _ = self.model.transcribe(
                 audio_1d,
@@ -337,6 +357,8 @@ class WhisperSTTEngine:
         except Exception as err:
             logger.debug("Partial transcription exception (non-critical): %s", err)
             return ""
+        finally:
+            self._inference_lock.release()
 
 
 
