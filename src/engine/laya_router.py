@@ -262,10 +262,18 @@ class LayaRouter:
             )
 
         # 2. Volume Up
-        if any(p in lower for p in [
-            "volume up", "turn it up", "turn up the volume", "turn up volume",
-            "louder", "make it louder", "raise the volume", "raise volume", "increase volume"
-        ]):
+        if (
+            re.search(r"\b(?:increase|raise|boost|turn\s*up|pump\s*up)\s+(?:the\s+)?(?:volume|sound|audio)\b", lower)
+            or re.search(r"\b(?:volume|sound|audio)\s+(?:up|higher)\b", lower)
+            or re.search(r"\bturn\s+(?:the\s+)?volume\s+up\b", lower)
+            or re.search(r"\b(?:make\s+it\s+)?louder\b", lower)
+            or "turn it up" in lower
+            or any(p in lower for p in [
+                "volume up", "turn it up", "turn up the volume", "turn up volume",
+                "louder", "make it louder", "raise the volume", "raise volume",
+                "increase volume", "increase the volume", "boost volume", "boost the volume"
+            ])
+        ):
             slots = self.extract_slots(lower, "volume_up")
             return LayaDecision(
                 intent="volume_up",
@@ -277,11 +285,18 @@ class LayaRouter:
             )
 
         # 3. Volume Down
-        if any(p in lower for p in [
-            "volume down", "lower the volume", "lower volume", "turn it down",
-            "turn down the volume", "turn down volume", "quieter", "make it quieter",
-            "decrease volume", "reduce volume"
-        ]):
+        if (
+            re.search(r"\b(?:decrease|lower|reduce|turn\s*down|drop)\s+(?:the\s+)?(?:volume|sound|audio)\b", lower)
+            or re.search(r"\b(?:volume|sound|audio)\s+(?:down|lower)\b", lower)
+            or re.search(r"\bturn\s+(?:the\s+)?volume\s+down\b", lower)
+            or re.search(r"\b(?:make\s+it\s+)?quieter\b", lower)
+            or "turn it down" in lower
+            or any(p in lower for p in [
+                "volume down", "lower the volume", "lower volume", "turn it down",
+                "turn down the volume", "turn down volume", "quieter", "make it quieter",
+                "decrease volume", "decrease the volume", "reduce volume", "reduce the volume"
+            ])
+        ):
             slots = self.extract_slots(lower, "volume_down")
             return LayaDecision(
                 intent="volume_down",
@@ -289,6 +304,20 @@ class LayaRouter:
                 urgency=1,
                 slots=slots,
                 confidence=0.95,
+                raw_text=text
+            )
+
+        # 3b. Greeting / Wake feedback ("hello", "hey echo", "hi echo")
+        if (
+            re.search(r"^(?:hello|hi|hey)(?:\s+(?:echo|there|assistant))?[!.,?]?$", lower.strip())
+            or re.search(r"\b(?:hello|hi|hey)\s+echo\b", lower)
+        ):
+            return LayaDecision(
+                intent="greeting",
+                is_actionable=0.88,
+                urgency=1,
+                slots={},
+                confidence=0.92,
                 raw_text=text
             )
 

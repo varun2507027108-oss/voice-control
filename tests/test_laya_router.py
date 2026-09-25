@@ -18,12 +18,32 @@ def test_volume_up_intent(router):
     assert decision.urgency == 1
     assert decision.should_execute is True
 
+    # User's exact test phrase
+    d2 = router.predict("increase the volume")
+    assert d2.intent == "volume_up"
+    assert d2.should_execute is True
+
 
 def test_volume_down_intent(router):
     decision = router.predict("lower the volume please")
     assert decision.intent == "volume_down"
     assert decision.is_actionable >= 0.82
     assert decision.urgency == 1
+
+    d2 = router.predict("decrease the volume")
+    assert d2.intent == "volume_down"
+    assert d2.should_execute is True
+
+
+def test_greeting_intent(router):
+    d1 = router.predict("hello")
+    assert d1.intent == "greeting"
+    assert d1.should_execute is True
+
+    d2 = router.predict("hi echo")
+    assert d2.intent == "greeting"
+    assert d2.should_execute is True
+
 
 
 def test_volume_set_percentage(router):

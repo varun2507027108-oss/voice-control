@@ -371,6 +371,9 @@ class SystemActions:
         elif intent == "lock_workstation":
             return cls.lock_workstation()
 
+        elif intent == "greeting":
+            return True, "👋 Hello! Echo is listening..."
+
         elif intent == "noop":
             return False, "No-op"
 

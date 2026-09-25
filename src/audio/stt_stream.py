@@ -14,6 +14,9 @@ import numpy as np
 
 logger = logging.getLogger("EchoFlux.STT")
 
+# Suppress noisy internal VAD logs from faster_whisper
+logging.getLogger("faster_whisper").setLevel(logging.WARNING)
+
 try:
     import sounddevice as sd
 except Exception as e:
@@ -77,6 +80,7 @@ class StreamingSTT:
         self.model_size = model_size
         self.model: Optional[WhisperModel] = None
         self._last_rms = 0.0
+        self.ambient_rms = 0.035  # Adaptive baseline noise floor
 
     def load_model(self):
         """Load faster-whisper model."""
@@ -100,14 +104,32 @@ class StreamingSTT:
             self.model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
 
     def _audio_callback(self, indata, frames, time_info, status):
-        """sounddevice streaming input callback."""
+        """sounddevice streaming input callback with stereo-to-mono downmixing."""
         if status:
             logger.debug("Sounddevice input status: %s", status)
         if not self.is_running:
             return
 
-        # indata shape is (frames, channels), extract channel 0
-        audio_chunk = indata[:, 0].copy()
+        # Handle multi-channel hardware (e.g. Realtek dual microphone arrays)
+        if indata.ndim > 1 and indata.shape[1] > 1:
+            ch0 = indata[:, 0]
+            ch1 = indata[:, 1]
+            rms0 = float(np.sqrt(np.mean(ch0 ** 2)))
+            rms1 = float(np.sqrt(np.mean(ch1 ** 2)))
+            # If one channel is significantly stronger, pick that channel to avoid phase cancellation
+            if rms1 > rms0 * 1.3:
+                audio_chunk = ch1.copy()
+            elif rms0 > rms1 * 1.3:
+                audio_chunk = ch0.copy()
+            else:
+                audio_chunk = (ch0 + ch1) * 0.5
+        elif indata.ndim > 1:
+            audio_chunk = indata[:, 0].copy()
+        else:
+            audio_chunk = indata.copy()
+
+        # Remove DC offset to center waveform around 0
+        audio_chunk = audio_chunk - float(np.mean(audio_chunk))
         self.audio_queue.put(audio_chunk)
 
     def _capture_worker(self):
@@ -120,7 +142,14 @@ class StreamingSTT:
 
             # Calculate RMS energy for visualizer
             rms = float(np.sqrt(np.mean(chunk ** 2)))
-            self._last_rms = min(1.0, rms * 10.0)  # normalized visual level
+
+            # Smoothly adapt ambient noise floor when audio is at rest
+            if rms < self.ambient_rms * 1.6 or self.ambient_rms == 0:
+                self.ambient_rms = 0.95 * self.ambient_rms + 0.05 * rms
+
+            # Active speech energy above noise floor for normalized visual HUD level (0.0 to 1.0)
+            active_energy = max(0.0, rms - self.ambient_rms * 0.8)
+            self._last_rms = min(1.0, active_energy * 6.0)
 
             with self.buffer_lock:
                 # Roll ring buffer and append new chunk
@@ -146,33 +175,37 @@ class StreamingSTT:
             with self.buffer_lock:
                 audio_data = self.ring_buffer.copy()
 
-            # VAD / silence gate: check energy of the most recent 0.5s
-            recent_chunk = audio_data[-int(self.sample_rate * 0.5):]
+            # Dynamic VAD / silence gate: check energy of the most recent 0.4s
+            recent_chunk = audio_data[-int(self.sample_rate * 0.4):]
             recent_rms = float(np.sqrt(np.mean(recent_chunk ** 2)))
 
-            if recent_rms < 0.005:
+            speech_threshold = max(0.030, self.ambient_rms * 1.25)
+
+            if recent_rms < speech_threshold:
                 silence_count += 1
-                if silence_count > 10 and last_text:
+                if silence_count > 6 and last_text:
                     if self.on_final:
                         self.on_final(last_text)
                     last_text = ""
-                # Keep notifying UI of silence / idle rms
-                if self.on_partial:
-                    self.on_partial(last_text, self._last_rms)
+                    if self.on_partial:
+                        self.on_partial("", self._last_rms)
+                else:
+                    # Keep notifying UI of silence / idle rms
+                    if self.on_partial:
+                        self.on_partial(last_text, self._last_rms)
                 time.sleep(0.08)
                 continue
 
             silence_count = 0
 
             try:
-                # Transcribe audio buffer
+                # Transcribe audio buffer (vad_filter=False because audio energy gate already triggered)
                 segments, info = self.model.transcribe(
                     audio_data,
                     beam_size=1,
                     language="en",
                     condition_on_previous_text=False,
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=250),
+                    vad_filter=False,
                 )
                 text_parts = [segment.text.strip() for segment in segments]
                 current_text = " ".join(text_parts).strip()
@@ -181,9 +214,9 @@ class StreamingSTT:
                     last_text = current_text
                     if self.on_partial:
                         self.on_partial(current_text, self._last_rms)
-                else:
+                elif last_text:
                     if self.on_partial:
-                        self.on_partial("", self._last_rms)
+                        self.on_partial(last_text, self._last_rms)
 
             except Exception as e:
                 logger.error("STT transcription error: %s", e)
@@ -203,15 +236,22 @@ class StreamingSTT:
 
         if sd is not None:
             try:
+                # Detect maximum supported input channels for the default mic
+                dev_info = sd.query_devices(kind='input')
+                channels_to_open = min(2, max(1, int(dev_info.get("max_input_channels", 1))))
+
                 self.stream = sd.InputStream(
                     samplerate=self.sample_rate,
-                    channels=1,
+                    channels=channels_to_open,
                     dtype="float32",
                     blocksize=self.chunk_size,
                     callback=self._audio_callback,
                 )
                 self.stream.start()
-                logger.info("Microphone audio stream started successfully.")
+                logger.info(
+                    "Microphone audio stream started (%s, %d channels @ %d Hz).",
+                    dev_info.get('name', 'Default'), channels_to_open, self.sample_rate
+                )
             except Exception as e:
                 logger.warning("Could not open microphone stream: %s. Using simulated feed.", e)
                 self.stream = None
