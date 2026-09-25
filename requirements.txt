@@ -1,11 +1,12 @@
+# EchoFlux Dependencies
+PyQt6>=6.6.0
+faster-whisper>=1.0.0
 sounddevice>=0.4.6
 numpy>=1.24.0
-scipy>=1.10.0
-torch>=2.0.0
-faster-whisper>=1.0.0
 onnxruntime>=1.16.0
-pycaw>=20240210
-screen_brightness_control>=0.23.0
 pyautogui>=0.9.54
-pytest>=7.4.0
-pytest-asyncio>=0.21.0
+pynput>=1.7.6
+pycaw>=20240101; sys_platform == 'win32'
+comtypes; sys_platform == 'win32'
+requests>=2.31.0
+tokenizers>=0.15.0
