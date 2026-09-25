@@ -227,7 +227,9 @@ class SileroVAD:
             best_ch = 0 if p0 >= p1 else 1
             return True, best_ch, p0, p1
         else:
-            best_ch = 0 if p0 >= p1 else 1
+            # Idle silence: always default to Channel 0 (clean primary mic capsule)
+            # Channel 1 on Realtek hardware carries continuous chassis rumble (~0.08 RMS)
+            best_ch = 0
             return False, best_ch, p0, p1
 
     def _evaluate_channel_stream(
@@ -250,7 +252,10 @@ class SileroVAD:
         max_prob = 0.0
         consec = getattr(self, consec_attr)
 
-        energy_speech = vad_tracker.is_speech(chunk, is_speaking=is_speaking)
+        # Protect vad_tracker from Channel 1 rumble: only evaluate energy_speech on Channel 0
+        energy_speech = False
+        if channel == 0:
+            energy_speech = vad_tracker.is_speech(chunk, is_speaking=is_speaking)
 
         while len(buf) >= 512:
             frame = buf[:512]
@@ -271,12 +276,12 @@ class SileroVAD:
                 self._frame_probs.append(prob)
 
             if is_speaking:
-                if prob >= self.hangover_threshold or (energy_speech and prob >= 0.08):
+                if prob >= self.hangover_threshold or (energy_speech and prob >= 0.05) or prob >= 0.12:
                     speech_detected = True
             else:
-                if prob >= self.onset_threshold or (energy_speech and prob >= 0.12):
+                if prob >= self.onset_threshold or (energy_speech and prob >= 0.08) or prob >= 0.18:
                     consec += 1
-                    if consec >= 2 or prob >= 0.40 or (energy_speech and prob >= 0.18):
+                    if consec >= 2 or prob >= 0.32 or (energy_speech and prob >= 0.12):
                         speech_detected = True
                 else:
                     consec = 0

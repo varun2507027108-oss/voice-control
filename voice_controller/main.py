@@ -629,17 +629,35 @@ class VoiceControllerPipeline:
         else:
             self._silent_since = None
 
-        if not self.is_speaking and not is_speech_chunk:
-            vad_tracker.adapt_floor(rms)
-
         now_time = time.perf_counter()
+
+        onset_th, _ = vad_tracker.get_thresholds()
+        dynamic_scale = max(0.015, (onset_th - vad_tracker.noise_floor) * 2.5)
+        norm_level = min(1.0, max(0.0, (rms - vad_tracker.noise_floor) / dynamic_scale))
+
+        # Only adapt noise floor during true ambient silence (quiet room baseline).
+        # NEVER adapt when the user is speaking or when acoustic energy / neural prob indicates voice!
+        if not self.is_speaking and not is_speech_chunk:
+            if p0 < 0.05 and p1 < 0.05 and norm_level < 0.15:
+                vad_tracker.adapt_floor(rms)
+
+        # Energy-assisted onset bridge: if audio level is clearly spiking (green lines jumping)
+        # and neural VAD indicates voice activity, trigger speech onset immediately!
+        if not is_speech_chunk:
+            if not self.is_speaking:
+                # Onset: green lines jumping (norm_level >= 0.20) + neural voice hint
+                if norm_level >= 0.20 and (p0 >= 0.05 or p1 >= 0.05):
+                    is_speech_chunk = True
+                    best_ch = 0 if p0 >= p1 else 1
+                    active_chunk = ch0_16k if best_ch == 0 or ch1_16k is None else ch1_16k
+            else:
+                # Continuation / hangover while speaking: keep alive if energy or voice persists
+                if norm_level >= 0.15 or p0 >= 0.05 or p1 >= 0.05:
+                    is_speech_chunk = True
 
         # Coalesced visual pulse level updates to HUD (throttled)
         if (now_time - self._last_hud_update) >= HUD_UPDATE_INTERVAL_S:
             self._last_hud_update = now_time
-            onset_th, _ = vad_tracker.get_thresholds()
-            dynamic_scale = max(0.015, (onset_th - vad_tracker.noise_floor) * 2.5)
-            norm_level = min(1.0, max(0.0, (rms - vad_tracker.noise_floor) / dynamic_scale))
             self.hud.update_state(audio_level=norm_level)
 
         # Capture-level telemetry: distinguishes dead mic from VAD disagreement

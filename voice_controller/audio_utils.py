@@ -301,6 +301,15 @@ class ChannelPreprocessor:
                 x = resample_poly(x, self.up, self.down).astype(np.float32)
             except Exception:
                 pass
+
+        # Mild pre-VAD leveling for quiet microphones
+        # When signal is above noise floor (>0.003) but quiet (<0.035), gently boost up to 3x
+        if len(x) > 0:
+            r = float(np.sqrt(np.mean(np.square(x))))
+            if 0.003 < r < 0.035:
+                gain = min(3.0, 0.035 / max(1e-5, r))
+                x = np.clip(x * gain, -0.95, 0.95)
+
         return x
 
     process_chunk = process
